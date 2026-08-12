@@ -27,6 +27,7 @@ import (
 // cloud-provider-kind supports, as defined by GEP-2162.
 var supportedFeatures = buildSupportedFeatures(
 	// Core
+	features.SupportBackendTLSPolicy,
 	features.SupportGateway,
 	features.SupportHTTPRoute,
 	features.SupportReferenceGrant,
