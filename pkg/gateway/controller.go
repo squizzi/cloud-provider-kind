@@ -713,6 +713,28 @@ func (c *Controller) processBackendTLSPolicy(obj interface{}) {
 				}
 			}
 		}
+
+		grpcRoutes, err := c.grpcrouteLister.List(labels.Everything())
+		if err != nil {
+			klog.Errorf("Failed to list GRPCRoutes: %v", err)
+			continue
+		}
+		for _, route := range grpcRoutes {
+			if grpcRouteReferencesService(route, serviceName, policy.Namespace) {
+				for _, parentRef := range route.Spec.ParentRefs {
+					if (parentRef.Group != nil && string(*parentRef.Group) != gatewayv1.GroupName) ||
+						(parentRef.Kind != nil && string(*parentRef.Kind) != "Gateway") {
+						continue
+					}
+					gwNamespace := route.Namespace
+					if parentRef.Namespace != nil {
+						gwNamespace = string(*parentRef.Namespace)
+					}
+					key := gwNamespace + "/" + string(parentRef.Name)
+					gatewaysToEnqueue[key] = struct{}{}
+				}
+			}
+		}
 	}
 
 	for key := range gatewaysToEnqueue {
@@ -753,6 +775,27 @@ func (c *Controller) processConfigMapForTLSPolicy(obj interface{}) {
 }
 
 func routeReferencesService(route *gatewayv1.HTTPRoute, serviceName, serviceNamespace string) bool {
+	for _, rule := range route.Spec.Rules {
+		for _, backendRef := range rule.BackendRefs {
+			if backendRef.Kind != nil && *backendRef.Kind != "Service" {
+				continue
+			}
+			if backendRef.Group != nil && *backendRef.Group != "" {
+				continue
+			}
+			refNamespace := route.Namespace
+			if backendRef.Namespace != nil {
+				refNamespace = string(*backendRef.Namespace)
+			}
+			if string(backendRef.Name) == serviceName && refNamespace == serviceNamespace {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func grpcRouteReferencesService(route *gatewayv1.GRPCRoute, serviceName, serviceNamespace string) bool {
 	for _, rule := range route.Spec.Rules {
 		for _, backendRef := range rule.BackendRefs {
 			if backendRef.Kind != nil && *backendRef.Kind != "Service" {

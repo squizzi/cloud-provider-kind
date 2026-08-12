@@ -9,10 +9,12 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	httpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
@@ -387,6 +389,7 @@ func (c *Controller) buildEnvoyResourcesForGateway(gateway *gatewayv1.Gateway) (
 					for _, backendRef := range validBackendRefs {
 						cluster, err := c.translateBackendRefToCluster(grpcRoute.Namespace, backendRef)
 						if err == nil && cluster != nil {
+							setHTTP2ProtocolOptions(cluster)
 							if _, exists := envoyClusters[cluster.Name]; !exists {
 								envoyClusters[cluster.Name] = cluster
 							}
@@ -974,6 +977,27 @@ func (c *Controller) translateBackendRefToCluster(defaultNamespace string, backe
 	}
 
 	return cluster, nil
+}
+
+// setHTTP2ProtocolOptions configures a cluster for HTTP/2 upstream connections.
+// gRPC requires HTTP/2; without this, Envoy defaults to HTTP/1.1.
+func setHTTP2ProtocolOptions(cluster *clusterv3.Cluster) {
+	h2Options, err := anypb.New(&httpv3.HttpProtocolOptions{
+		UpstreamProtocolOptions: &httpv3.HttpProtocolOptions_ExplicitHttpConfig_{
+			ExplicitHttpConfig: &httpv3.HttpProtocolOptions_ExplicitHttpConfig{
+				ProtocolConfig: &httpv3.HttpProtocolOptions_ExplicitHttpConfig_Http2ProtocolOptions{
+					Http2ProtocolOptions: &corev3.Http2ProtocolOptions{},
+				},
+			},
+		},
+	})
+	if err != nil {
+		klog.Errorf("failed to marshal HTTP/2 protocol options: %v", err)
+		return
+	}
+	cluster.TypedExtensionProtocolOptions = map[string]*anypb.Any{
+		"envoy.extensions.upstreams.http.v3.HttpProtocolOptions": h2Options,
+	}
 }
 
 func (c *Controller) deleteGatewayResources(ctx context.Context, name, namespace string) error {
