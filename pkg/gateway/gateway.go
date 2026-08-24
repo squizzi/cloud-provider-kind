@@ -161,7 +161,10 @@ func (c *Controller) syncGateway(ctx context.Context, key string) error {
 			return err
 		}
 	}
-	return c.updateRouteStatuses(ctx, httpRouteStatuses, grpcRouteStatuses)
+	if err := c.updateRouteStatuses(ctx, httpRouteStatuses, grpcRouteStatuses); err != nil {
+		return err
+	}
+	return c.updateBackendTLSPolicyStatuses(ctx, newGw)
 }
 
 // Main State Calculation Function
@@ -305,14 +308,23 @@ func (c *Controller) buildEnvoyResourcesForGateway(gateway *gatewayv1.Gateway) (
 					httpRouteStatuses[key] = currentParentStatuses
 
 					// Create the necessary Envoy Cluster resources from the valid backends.
+					invalidTLSClusters := map[string]struct{}{}
 					for _, backendRef := range validBackendRefs {
 						cluster, err := c.translateBackendRefToCluster(httpRoute.Namespace, backendRef)
+						if isBackendTLSError(err) {
+							name, nameErr := backendRefToClusterName(httpRoute.Namespace, backendRef)
+							if nameErr == nil {
+								invalidTLSClusters[name] = struct{}{}
+							}
+							continue
+						}
 						if err == nil && cluster != nil {
 							if _, exists := envoyClusters[cluster.Name]; !exists {
 								envoyClusters[cluster.Name] = cluster
 							}
 						}
 					}
+					rewriteRoutesForInvalidBackendTLS(routes, invalidTLSClusters)
 
 					// Aggregate Envoy routes into VirtualHosts.
 					if routes != nil {
@@ -736,11 +748,11 @@ func (c *Controller) translateBackendRefToCluster(defaultNamespace string, backe
 		cluster.LoadAssignment = createClusterLoadAssignment(clusterName, service.Spec.ClusterIP, uint32(*backendRef.Port))
 	}
 
-	if policy := c.lookupBackendTLSPolicy(ns, string(backendRef.Name)); policy != nil {
+	portName := servicePortName(service, backendRef)
+	if policy := c.lookupBackendTLSPolicy(ns, string(backendRef.Name), portName); policy != nil {
 		tlsContextAny, err := c.buildUpstreamTLSContext(policy)
 		if err != nil {
-			return nil, fmt.Errorf("invalid BackendTLSPolicy %s/%s for service %s/%s: %w",
-				policy.Namespace, policy.Name, ns, backendRef.Name, err)
+			return nil, err
 		}
 		cluster.TransportSocket = &corev3.TransportSocket{
 			Name: "envoy.transport_sockets.tls",
