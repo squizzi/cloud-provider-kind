@@ -10,6 +10,7 @@ import (
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	"google.golang.org/protobuf/types/known/anypb"
+	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -185,6 +186,7 @@ func translateHTTPRouteToEnvoyRoutes(
 			envoyRoute.RequestHeadersToAdd = headersToAdd
 			envoyRoute.RequestHeadersToRemove = headersToRemove
 			envoyRoute.TypedPerFilterConfig = extAuthPerRoute
+			setRouteSortMeta(envoyRoute, false, 0, 0, httpRoute.CreationTimestamp, httpRoute.Namespace, httpRoute.Name)
 
 			if redirectAction != nil {
 				// If this is a redirect, set the Redirect action. No backends are needed.
@@ -488,54 +490,160 @@ func createPartiallyInvalidCondition(message string, generation int64) metav1.Co
 	}
 }
 
+const routeSortMetadataKey = "cloud-provider-kind.gateway"
+
+type routeSortMeta struct {
+	isGRPC     bool
+	serviceLen int
+	methodLen  int
+	created    int64
+	nsName     string
+}
+
+func setRouteSortMeta(route *routev3.Route, isGRPC bool, serviceLen, methodLen int, created metav1.Time, namespace, name string) {
+	if route == nil {
+		return
+	}
+	st, err := structpb.NewStruct(map[string]interface{}{
+		"grpc":        isGRPC,
+		"service_len": serviceLen,
+		"method_len":  methodLen,
+		"created":     created.UnixMicro(),
+		"ns_name":     namespace + "/" + name,
+	})
+	if err != nil {
+		return
+	}
+	route.Metadata = &corev3.Metadata{
+		FilterMetadata: map[string]*structpb.Struct{
+			routeSortMetadataKey: st,
+		},
+	}
+}
+
+func getRouteSortMeta(route *routev3.Route) routeSortMeta {
+	if route == nil || route.Metadata == nil {
+		return routeSortMeta{}
+	}
+	st := route.Metadata.FilterMetadata[routeSortMetadataKey]
+	if st == nil {
+		return routeSortMeta{}
+	}
+	fields := st.Fields
+	meta := routeSortMeta{}
+	if v, ok := fields["grpc"]; ok {
+		meta.isGRPC = v.GetBoolValue()
+	}
+	if v, ok := fields["service_len"]; ok {
+		meta.serviceLen = int(v.GetNumberValue())
+	}
+	if v, ok := fields["method_len"]; ok {
+		meta.methodLen = int(v.GetNumberValue())
+	}
+	if v, ok := fields["created"]; ok {
+		meta.created = int64(v.GetNumberValue())
+	}
+	if v, ok := fields["ns_name"]; ok {
+		meta.nsName = v.GetStringValue()
+	}
+	return meta
+}
+
+func compareRouteMetaTieBreak(a, b routeSortMeta) int {
+	if a.created != b.created {
+		if a.created < b.created {
+			return -1
+		}
+		return 1
+	}
+	if a.nsName != b.nsName {
+		if a.nsName < b.nsName {
+			return -1
+		}
+		return 1
+	}
+	return 0
+}
+
 // sortRoutes is the definitive sorter for Envoy routes based on Gateway API precedence.
 func sortRoutes(routes []*routev3.Route) {
-	sort.Slice(routes, func(i, j int) bool {
-		matchI := routes[i].GetMatch()
-		matchJ := routes[j].GetMatch()
-
-		// De-prioritize the catch-all route, ensuring it's always last.
-		isCatchAllI := isCatchAll(matchI)
-		isCatchAllJ := isCatchAll(matchJ)
-
-		if isCatchAllI != isCatchAllJ {
-			// If I is the catch-all, it should come after J (return false).
-			// If J is the catch-all, it should come after I (return true).
-			return isCatchAllJ
+	sort.SliceStable(routes, func(i, j int) bool {
+		metaI := getRouteSortMeta(routes[i])
+		metaJ := getRouteSortMeta(routes[j])
+		if metaI.isGRPC && metaJ.isGRPC {
+			return lessGRPCRoute(routes[i], routes[j], metaI, metaJ)
 		}
-
-		// Precedence Rule 1: Exact Path Match vs. Other Path Matches
-		isExactPathI := matchI.GetPath() != ""
-		isExactPathJ := matchJ.GetPath() != ""
-		if isExactPathI != isExactPathJ {
-			return isExactPathI // Exact path is higher precedence
-		}
-
-		// Precedence Rule 2: Longest Prefix Match
-		prefixI := getPathMatchValue(matchI)
-		prefixJ := getPathMatchValue(matchJ)
-
-		if len(prefixI) != len(prefixJ) {
-			return len(prefixI) > len(prefixJ) // Longer prefix is higher precedence
-		}
-
-		// Precedence Rule 3: Number of Header Matches
-		headerCountI := len(matchI.GetHeaders())
-		headerCountJ := len(matchJ.GetHeaders())
-		if headerCountI != headerCountJ {
-			return headerCountI > headerCountJ // More headers is higher precedence
-		}
-
-		// Precedence Rule 4: Number of Query Param Matches
-		queryCountI := len(matchI.GetQueryParameters())
-		queryCountJ := len(matchJ.GetQueryParameters())
-		if queryCountI != queryCountJ {
-			return queryCountI > queryCountJ // More query params is higher precedence
-		}
-
-		// If all else is equal, maintain original order (stable sort)
-		return false
+		return lessHTTPRoute(routes[i], routes[j], metaI, metaJ)
 	})
+}
+
+func lessGRPCRoute(routeI, routeJ *routev3.Route, metaI, metaJ routeSortMeta) bool {
+	matchI := routeI.GetMatch()
+	matchJ := routeJ.GetMatch()
+
+	isCatchAllI := isCatchAll(matchI)
+	isCatchAllJ := isCatchAll(matchJ)
+	if isCatchAllI != isCatchAllJ {
+		return isCatchAllJ
+	}
+	if metaI.serviceLen != metaJ.serviceLen {
+		return metaI.serviceLen > metaJ.serviceLen
+	}
+	if metaI.methodLen != metaJ.methodLen {
+		return metaI.methodLen > metaJ.methodLen
+	}
+	headerCountI := len(matchI.GetHeaders())
+	headerCountJ := len(matchJ.GetHeaders())
+	if headerCountI != headerCountJ {
+		return headerCountI > headerCountJ
+	}
+	return compareRouteMetaTieBreak(metaI, metaJ) < 0
+}
+
+func lessHTTPRoute(routeI, routeJ *routev3.Route, metaI, metaJ routeSortMeta) bool {
+	matchI := routeI.GetMatch()
+	matchJ := routeJ.GetMatch()
+
+	// De-prioritize the catch-all route, ensuring it's always last.
+	isCatchAllI := isCatchAll(matchI)
+	isCatchAllJ := isCatchAll(matchJ)
+
+	if isCatchAllI != isCatchAllJ {
+		// If I is the catch-all, it should come after J (return false).
+		// If J is the catch-all, it should come after I (return true).
+		return isCatchAllJ
+	}
+
+	// Precedence Rule 1: Exact Path Match vs. Other Path Matches
+	isExactPathI := matchI.GetPath() != ""
+	isExactPathJ := matchJ.GetPath() != ""
+	if isExactPathI != isExactPathJ {
+		return isExactPathI // Exact path is higher precedence
+	}
+
+	// Precedence Rule 2: Longest Prefix Match
+	prefixI := getPathMatchValue(matchI)
+	prefixJ := getPathMatchValue(matchJ)
+
+	if len(prefixI) != len(prefixJ) {
+		return len(prefixI) > len(prefixJ) // Longer prefix is higher precedence
+	}
+
+	// Precedence Rule 3: Number of Header Matches
+	headerCountI := len(matchI.GetHeaders())
+	headerCountJ := len(matchJ.GetHeaders())
+	if headerCountI != headerCountJ {
+		return headerCountI > headerCountJ // More headers is higher precedence
+	}
+
+	// Precedence Rule 4: Number of Query Param Matches
+	queryCountI := len(matchI.GetQueryParameters())
+	queryCountJ := len(matchJ.GetQueryParameters())
+	if queryCountI != queryCountJ {
+		return queryCountI > queryCountJ // More query params is higher precedence
+	}
+
+	return compareRouteMetaTieBreak(metaI, metaJ) < 0
 }
 
 // getPathMatchValue is a helper to extract the path string for comparison.

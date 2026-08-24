@@ -8,6 +8,7 @@ import (
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
+	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -15,6 +16,18 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewaylistersv1 "sigs.k8s.io/gateway-api/pkg/client/listers/apis/v1"
 )
+
+const (
+	grpcClusterNameSuffix       = "-h2"
+	grpcUnavailableClusterName  = "kind-grpc-unavailable"
+	grpcStatusUnavailable       = "14" // gRPC status code UNAVAILABLE
+	grpcUnavailableStatusHeader = "grpc-status"
+	grpcUnavailableMessage      = "unavailable"
+)
+
+func grpcClusterName(clusterName string) string {
+	return clusterName + grpcClusterNameSuffix
+}
 
 func translateGRPCRouteToEnvoyRoutes(
 	grpcRoute *gatewayv1.GRPCRoute,
@@ -36,15 +49,41 @@ func translateGRPCRouteToEnvoyRoutes(
 			continue
 		}
 
-		var headersToAdd []*corev3.HeaderValueOption
-		var headersToRemove []string
+		var requestHeadersToAdd []*corev3.HeaderValueOption
+		var requestHeadersToRemove []string
+		var responseHeadersToAdd []*corev3.HeaderValueOption
+		var responseHeadersToRemove []string
 		for _, filter := range rule.Filters {
-			if filter.Type == gatewayv1.GRPCRouteFilterRequestHeaderModifier && filter.RequestHeaderModifier != nil {
-				add, remove := translateHTTPHeaderFilter(filter.RequestHeaderModifier)
-				headersToAdd = append(headersToAdd, add...)
-				headersToRemove = append(headersToRemove, remove...)
+			switch filter.Type {
+			case gatewayv1.GRPCRouteFilterRequestHeaderModifier:
+				if filter.RequestHeaderModifier != nil {
+					add, remove := translateHTTPHeaderFilter(filter.RequestHeaderModifier)
+					requestHeadersToAdd = append(requestHeadersToAdd, add...)
+					requestHeadersToRemove = append(requestHeadersToRemove, remove...)
+				}
+			case gatewayv1.GRPCRouteFilterResponseHeaderModifier:
+				if filter.ResponseHeaderModifier != nil {
+					add, remove := translateHTTPHeaderFilter(filter.ResponseHeaderModifier)
+					responseHeadersToAdd = append(responseHeadersToAdd, add...)
+					responseHeadersToRemove = append(responseHeadersToRemove, remove...)
+				}
 			}
 		}
+
+		mirrors, mirrorBackends, mirrorErr := buildGRPCRequestMirrors(
+			grpcRoute.Namespace,
+			rule.Filters,
+			serviceLister,
+			referenceGrantLister,
+		)
+		if mirrorErr != nil && resolvedRefsFailure == nil {
+			var controllerErr *ControllerError
+			if errors.As(mirrorErr, &controllerErr) {
+				cond := createNotResolvedCondition(gatewayv1.RouteConditionReason(controllerErr.Reason), controllerErr.Message, grpcRoute.Generation)
+				resolvedRefsFailure = &cond
+			}
+		}
+		allValidBackendRefs = append(allValidBackendRefs, mirrorBackends...)
 
 		buildRoutesForRule := func(match gatewayv1.GRPCRouteMatch, matchIndex int) {
 			routeMatch, dropReason := translateGRPCRouteMatch(match)
@@ -55,11 +94,15 @@ func translateGRPCRouteToEnvoyRoutes(
 			}
 
 			envoyRoute := &routev3.Route{
-				Name:                   fmt.Sprintf("%s-%s-rule%d-match%d", grpcRoute.Namespace, grpcRoute.Name, ruleIndex, matchIndex),
-				Match:                  routeMatch,
-				RequestHeadersToAdd:    headersToAdd,
-				RequestHeadersToRemove: headersToRemove,
+				Name:                    fmt.Sprintf("%s-%s-rule%d-match%d", grpcRoute.Namespace, grpcRoute.Name, ruleIndex, matchIndex),
+				Match:                   routeMatch,
+				RequestHeadersToAdd:     requestHeadersToAdd,
+				RequestHeadersToRemove:  requestHeadersToRemove,
+				ResponseHeadersToAdd:    responseHeadersToAdd,
+				ResponseHeadersToRemove: responseHeadersToRemove,
 			}
+			serviceLen, methodLen := grpcMethodMatchLengths(match.Method)
+			setRouteSortMeta(envoyRoute, true, serviceLen, methodLen, grpcRoute.CreationTimestamp, grpcRoute.Namespace, grpcRoute.Name)
 
 			routeAction, validBackends, err := buildGRPCRouteAction(
 				grpcRoute.Namespace,
@@ -71,17 +114,41 @@ func translateGRPCRouteToEnvoyRoutes(
 			var noBackendsErr *noEffectiveBackendsError
 			switch {
 			case errors.As(err, &noBackendsErr):
-				envoyRoute.Action = &routev3.Route_DirectResponse{
-					DirectResponse: &routev3.DirectResponseAction{Status: 500},
+				if len(mirrors) > 0 {
+					envoyRoute.Action = &routev3.Route_Route{
+						Route: &routev3.RouteAction{
+							ClusterSpecifier:      &routev3.RouteAction_Cluster{Cluster: grpcUnavailableClusterName},
+							RequestMirrorPolicies: mirrors,
+						},
+					}
+				} else {
+					applyGRPCUnavailableDirectResponse(envoyRoute)
 				}
 			case errors.As(err, &controllerErr):
-				cond := createNotResolvedCondition(gatewayv1.RouteConditionReason(controllerErr.Reason), controllerErr.Message, grpcRoute.Generation)
-				resolvedRefsFailure = &cond
-				envoyRoute.Action = &routev3.Route_DirectResponse{
-					DirectResponse: &routev3.DirectResponseAction{Status: 500},
+				if resolvedRefsFailure == nil {
+					cond := createNotResolvedCondition(gatewayv1.RouteConditionReason(controllerErr.Reason), controllerErr.Message, grpcRoute.Generation)
+					resolvedRefsFailure = &cond
+				}
+				switch {
+				case routeAction != nil:
+					routeAction.RequestMirrorPolicies = mirrors
+					allValidBackendRefs = append(allValidBackendRefs, validBackends...)
+					envoyRoute.Action = &routev3.Route_Route{Route: routeAction}
+				case len(mirrors) > 0:
+					envoyRoute.Action = &routev3.Route_Route{
+						Route: &routev3.RouteAction{
+							ClusterSpecifier:      &routev3.RouteAction_Cluster{Cluster: grpcUnavailableClusterName},
+							RequestMirrorPolicies: mirrors,
+						},
+					}
+				default:
+					applyGRPCUnavailableDirectResponse(envoyRoute)
 				}
 			default:
 				allValidBackendRefs = append(allValidBackendRefs, validBackends...)
+				if routeAction != nil {
+					routeAction.RequestMirrorPolicies = mirrors
+				}
 				envoyRoute.Action = &routev3.Route_Route{
 					Route: routeAction,
 				}
@@ -116,7 +183,9 @@ func translateGRPCRouteToEnvoyRoutes(
 func findUnsupportedGRPCFilter(filters []gatewayv1.GRPCRouteFilter) (gatewayv1.GRPCRouteFilterType, bool) {
 	for _, filter := range filters {
 		switch filter.Type {
-		case gatewayv1.GRPCRouteFilterRequestHeaderModifier:
+		case gatewayv1.GRPCRouteFilterRequestHeaderModifier,
+			gatewayv1.GRPCRouteFilterResponseHeaderModifier,
+			gatewayv1.GRPCRouteFilterRequestMirror:
 		default:
 			return filter.Type, true
 		}
@@ -124,12 +193,43 @@ func findUnsupportedGRPCFilter(filters []gatewayv1.GRPCRouteFilter) (gatewayv1.G
 	return "", false
 }
 
+func applyGRPCUnavailableDirectResponse(route *routev3.Route) {
+	route.Action = &routev3.Route_DirectResponse{
+		DirectResponse: &routev3.DirectResponseAction{Status: 200},
+	}
+	overwrite := corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD
+	route.ResponseHeadersToAdd = append(route.ResponseHeadersToAdd,
+		&corev3.HeaderValueOption{
+			Header:       &corev3.HeaderValue{Key: "content-type", Value: "application/grpc"},
+			AppendAction: overwrite,
+		},
+		&corev3.HeaderValueOption{
+			Header:       &corev3.HeaderValue{Key: grpcUnavailableStatusHeader, Value: grpcStatusUnavailable},
+			AppendAction: overwrite,
+		},
+		&corev3.HeaderValueOption{
+			Header:       &corev3.HeaderValue{Key: "grpc-message", Value: grpcUnavailableMessage},
+			AppendAction: overwrite,
+		},
+	)
+}
+
 func buildGRPCRouteAction(namespace string, backendRefs []gatewayv1.GRPCBackendRef, serviceLister corev1listers.ServiceLister, referenceGrantLister gatewaylistersv1.ReferenceGrantLister) (*routev3.RouteAction, []gatewayv1.BackendRef, error) {
 	weightedClusters := &routev3.WeightedCluster{}
 	var validBackendRefs []gatewayv1.BackendRef
+	var firstErr error
+	var unavailableWeight uint32
 
 	for _, grpcBackendRef := range backendRefs {
 		backendRef := grpcBackendRef.BackendRef
+
+		weight := int32(1)
+		if grpcBackendRef.Weight != nil {
+			weight = *grpcBackendRef.Weight
+		}
+		if weight == 0 {
+			continue
+		}
 
 		ns := namespace
 		if backendRef.Namespace != nil {
@@ -149,40 +249,55 @@ func buildGRPCRouteAction(namespace string, backendRefs []gatewayv1.GRPCBackendR
 			}
 
 			if !isCrossNamespaceRefAllowed(from, to, ns, referenceGrantLister) {
-				return nil, nil, &ControllerError{
-					Reason:  string(gatewayv1.RouteReasonRefNotPermitted),
-					Message: "permission error",
+				if firstErr == nil {
+					firstErr = &ControllerError{
+						Reason:  string(gatewayv1.RouteReasonRefNotPermitted),
+						Message: "permission error",
+					}
 				}
+				unavailableWeight += uint32(weight)
+				continue
 			}
 		}
 
 		if _, err := serviceLister.Services(ns).Get(string(backendRef.Name)); err != nil {
-			return nil, nil, &ControllerError{
-				Reason:  string(gatewayv1.RouteReasonBackendNotFound),
-				Message: "backend not found",
+			if firstErr == nil {
+				firstErr = &ControllerError{
+					Reason:  string(gatewayv1.RouteReasonBackendNotFound),
+					Message: "backend not found",
+				}
 			}
+			unavailableWeight += uint32(weight)
+			continue
 		}
 		clusterName, err := backendRefToClusterName(namespace, backendRef)
 		if err != nil {
-			return nil, nil, err
-		}
-
-		weight := int32(1)
-		if grpcBackendRef.Weight != nil {
-			weight = *grpcBackendRef.Weight
-		}
-		if weight == 0 {
+			if firstErr == nil {
+				firstErr = err
+			}
+			unavailableWeight += uint32(weight)
 			continue
 		}
+
 		validBackendRefs = append(validBackendRefs, backendRef)
 		weightedClusters.Clusters = append(weightedClusters.Clusters, &routev3.WeightedCluster_ClusterWeight{
-			Name:   clusterName,
+			Name:   grpcClusterName(clusterName),
 			Weight: &wrapperspb.UInt32Value{Value: uint32(weight)},
 		})
 	}
 
 	if len(weightedClusters.Clusters) == 0 {
+		if firstErr != nil {
+			return nil, nil, firstErr
+		}
 		return nil, nil, &noEffectiveBackendsError{}
+	}
+
+	if unavailableWeight > 0 {
+		weightedClusters.Clusters = append(weightedClusters.Clusters, &routev3.WeightedCluster_ClusterWeight{
+			Name:   grpcUnavailableClusterName,
+			Weight: &wrapperspb.UInt32Value{Value: unavailableWeight},
+		})
 	}
 
 	var action *routev3.RouteAction
@@ -192,7 +307,120 @@ func buildGRPCRouteAction(namespace string, backendRefs []gatewayv1.GRPCBackendR
 		action = &routev3.RouteAction{ClusterSpecifier: &routev3.RouteAction_WeightedClusters{WeightedClusters: weightedClusters}}
 	}
 
-	return action, validBackendRefs, nil
+	return action, validBackendRefs, firstErr
+}
+
+func buildGRPCRequestMirrors(
+	namespace string,
+	filters []gatewayv1.GRPCRouteFilter,
+	serviceLister corev1listers.ServiceLister,
+	referenceGrantLister gatewaylistersv1.ReferenceGrantLister,
+) ([]*routev3.RouteAction_RequestMirrorPolicy, []gatewayv1.BackendRef, error) {
+	var policies []*routev3.RouteAction_RequestMirrorPolicy
+	var validBackendRefs []gatewayv1.BackendRef
+	var firstErr error
+
+	for _, filter := range filters {
+		if filter.Type != gatewayv1.GRPCRouteFilterRequestMirror || filter.RequestMirror == nil {
+			continue
+		}
+		backendRef := gatewayv1.BackendRef{BackendObjectReference: filter.RequestMirror.BackendRef}
+		ns := namespace
+		if backendRef.Namespace != nil {
+			ns = string(*backendRef.Namespace)
+		}
+		if ns != namespace {
+			from := gatewayv1.ReferenceGrantFrom{
+				Group:     gatewayv1.GroupName,
+				Kind:      "GRPCRoute",
+				Namespace: gatewayv1.Namespace(namespace),
+			}
+			to := gatewayv1.ReferenceGrantTo{
+				Group: "",
+				Kind:  "Service",
+				Name:  &backendRef.Name,
+			}
+			if !isCrossNamespaceRefAllowed(from, to, ns, referenceGrantLister) {
+				if firstErr == nil {
+					firstErr = &ControllerError{
+						Reason:  string(gatewayv1.RouteReasonRefNotPermitted),
+						Message: "permission error",
+					}
+				}
+				continue
+			}
+		}
+		if _, err := serviceLister.Services(ns).Get(string(backendRef.Name)); err != nil {
+			if firstErr == nil {
+				firstErr = &ControllerError{
+					Reason:  string(gatewayv1.RouteReasonBackendNotFound),
+					Message: "backend not found",
+				}
+			}
+			continue
+		}
+		clusterName, err := backendRefToClusterName(namespace, backendRef)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		validBackendRefs = append(validBackendRefs, backendRef)
+		policies = append(policies, &routev3.RouteAction_RequestMirrorPolicy{
+			Cluster:         grpcClusterName(clusterName),
+			RuntimeFraction: mirrorRuntimeFraction(filter.RequestMirror),
+		})
+	}
+	return policies, validBackendRefs, firstErr
+}
+
+func mirrorRuntimeFraction(filter *gatewayv1.HTTPRequestMirrorFilter) *corev3.RuntimeFractionalPercent {
+	fp := &typev3.FractionalPercent{
+		Numerator:   100,
+		Denominator: typev3.FractionalPercent_HUNDRED,
+	}
+	if filter == nil {
+		return &corev3.RuntimeFractionalPercent{DefaultValue: fp}
+	}
+	switch {
+	case filter.Fraction != nil:
+		den := int32(100)
+		if filter.Fraction.Denominator != nil {
+			den = *filter.Fraction.Denominator
+		}
+		// Envoy FractionalPercent supports 100, 10_000, and 1_000_000.
+		switch den {
+		case 10000:
+			fp.Numerator = uint32(filter.Fraction.Numerator)
+			fp.Denominator = typev3.FractionalPercent_TEN_THOUSAND
+		case 1000000:
+			fp.Numerator = uint32(filter.Fraction.Numerator)
+			fp.Denominator = typev3.FractionalPercent_MILLION
+		default:
+			// Convert N/den to millionths so 1000 and other denominators work.
+			if den > 0 {
+				fp.Numerator = uint32(int64(filter.Fraction.Numerator) * 1000000 / int64(den))
+				fp.Denominator = typev3.FractionalPercent_MILLION
+			}
+		}
+	case filter.Percent != nil:
+		fp.Numerator = uint32(*filter.Percent)
+	}
+	return &corev3.RuntimeFractionalPercent{DefaultValue: fp}
+}
+
+func grpcMethodMatchLengths(method *gatewayv1.GRPCMethodMatch) (serviceLen, methodLen int) {
+	if method == nil {
+		return 0, 0
+	}
+	if method.Service != nil {
+		serviceLen = len(*method.Service)
+	}
+	if method.Method != nil {
+		methodLen = len(*method.Method)
+	}
+	return serviceLen, methodLen
 }
 
 // translateGRPCRouteMatch translates a GRPCRouteMatch to an Envoy RouteMatch.
@@ -217,29 +445,31 @@ func translateGRPCRouteMatch(match gatewayv1.GRPCRouteMatch) (*routev3.RouteMatc
 
 		switch matchType {
 		case gatewayv1.GRPCMethodMatchExact:
-			if service != "" && method != "" {
+			switch {
+			case service != "" && method != "":
 				routeMatch.PathSpecifier = &routev3.RouteMatch_Path{Path: "/" + service + "/" + method}
-			} else if service != "" {
+			case service != "":
 				routeMatch.PathSpecifier = &routev3.RouteMatch_Prefix{Prefix: "/" + service + "/"}
-			} else if method != "" {
+			case method != "":
 				routeMatch.PathSpecifier = &routev3.RouteMatch_SafeRegex{
 					SafeRegex: &matcherv3.RegexMatcher{
 						EngineType: &matcherv3.RegexMatcher_GoogleRe2{GoogleRe2: &matcherv3.RegexMatcher_GoogleRE2{}},
 						Regex:      "/[^/]+/" + method,
 					},
 				}
-			} else {
+			default:
 				routeMatch.PathSpecifier = &routev3.RouteMatch_Prefix{Prefix: "/"}
 			}
 		case gatewayv1.GRPCMethodMatchRegularExpression:
 			var pattern string
-			if service != "" && method != "" {
+			switch {
+			case service != "" && method != "":
 				pattern = "/" + service + "/" + method
-			} else if service != "" {
+			case service != "":
 				pattern = "/" + service + "/.*"
-			} else if method != "" {
+			case method != "":
 				pattern = "/[^/]+/" + method
-			} else {
+			default:
 				pattern = "/.*"
 			}
 			routeMatch.PathSpecifier = &routev3.RouteMatch_SafeRegex{
@@ -256,7 +486,14 @@ func translateGRPCRouteMatch(match gatewayv1.GRPCRouteMatch) (*routev3.RouteMatc
 		routeMatch.PathSpecifier = &routev3.RouteMatch_Prefix{Prefix: "/"}
 	}
 
+	seenHeaders := map[string]struct{}{}
 	for _, headerMatch := range match.Headers {
+		canonical := strings.ToLower(string(headerMatch.Name))
+		if _, seen := seenHeaders[canonical]; seen {
+			continue
+		}
+		seenHeaders[canonical] = struct{}{}
+
 		headerMatcher := &routev3.HeaderMatcher{
 			Name: string(headerMatch.Name),
 		}

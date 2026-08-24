@@ -255,6 +255,9 @@ func (c *Controller) translateListenerToFilterChain(gateway *gatewayv1.Gateway, 
 			// Enable X-Forwarded-For header
 			// https://github.com/kubernetes-sigs/cloud-provider-kind/issues/296
 			UseRemoteAddress: &wrapperspb.BoolValue{Value: true},
+			// Advertise HTTP/2 so GRPCRoute can use h2c prior knowledge on HTTP
+			// listeners and ALPN-negotiated h2 on HTTPS listeners.
+			Http2ProtocolOptions: &corev3.Http2ProtocolOptions{},
 			// Support websocket upgrade
 			// https://github.com/kubernetes-sigs/cloud-provider-kind/issues/355
 			UpgradeConfigs: []*hcm.HttpConnectionManager_UpgradeConfig{{

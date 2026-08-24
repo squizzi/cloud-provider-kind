@@ -209,6 +209,8 @@ func (c *Controller) buildEnvoyResourcesForGateway(gateway *gatewayv1.Gateway) (
 		}
 	}
 
+	applyHTTPGRPCHostnameUniqueness(gateway, routesByListener, grpcRoutesByListener, httpRouteStatuses, grpcRouteStatuses)
+
 	// Build Envoy config using only the pre-validated and accepted routes
 	envoyRoutes := []envoyproxytypes.Resource{}
 	envoyClusters := make(map[string]envoyproxytypes.Resource)
@@ -388,10 +390,8 @@ func (c *Controller) buildEnvoyResourcesForGateway(gateway *gatewayv1.Gateway) (
 					for _, backendRef := range validBackendRefs {
 						cluster, err := c.translateBackendRefToCluster(grpcRoute.Namespace, backendRef)
 						if err == nil && cluster != nil {
-							setHTTP2ProtocolOptions(cluster)
-							if _, exists := envoyClusters[cluster.Name]; !exists {
-								envoyClusters[cluster.Name] = cluster
-							}
+							applyGRPCCluster(cluster)
+							envoyClusters[cluster.Name] = cluster
 						}
 					}
 
@@ -497,7 +497,18 @@ func (c *Controller) buildEnvoyResourcesForGateway(gateway *gatewayv1.Gateway) (
 		}
 	}
 
-	clustersSlice := make([]envoyproxytypes.Resource, 0, len(envoyClusters))
+	clustersSlice := make([]envoyproxytypes.Resource, 0, len(envoyClusters)+1)
+	hasGRPC := false
+	for _, routes := range grpcRoutesByListener {
+		if len(routes) > 0 {
+			hasGRPC = true
+			break
+		}
+	}
+	if hasGRPC {
+		unavailable := newGRPCUnavailableCluster()
+		envoyClusters[unavailable.Name] = unavailable
+	}
 	for _, cluster := range envoyClusters {
 		clustersSlice = append(clustersSlice, cluster)
 	}
@@ -985,6 +996,33 @@ func setHTTP2ProtocolOptions(cluster *clusterv3.Cluster) {
 	cluster.TypedExtensionProtocolOptions = map[string]*anypb.Any{
 		"envoy.extensions.upstreams.http.v3.HttpProtocolOptions": h2Options,
 	}
+}
+
+func applyGRPCCluster(cluster *clusterv3.Cluster) {
+	if cluster == nil {
+		return
+	}
+	cluster.Name = grpcClusterName(cluster.Name)
+	if cluster.LoadAssignment != nil {
+		cluster.LoadAssignment.ClusterName = cluster.Name
+	}
+	setHTTP2ProtocolOptions(cluster)
+}
+
+func newGRPCUnavailableCluster() *clusterv3.Cluster {
+	cluster := &clusterv3.Cluster{
+		Name:                 grpcUnavailableClusterName,
+		ConnectTimeout:       durationpb.New(time.Second),
+		ClusterDiscoveryType: &clusterv3.Cluster_Type{Type: clusterv3.Cluster_STATIC},
+		CommonLbConfig: &clusterv3.Cluster_CommonLbConfig{
+			HealthyPanicThreshold: &typev3.Percent{Value: 0},
+		},
+		LoadAssignment: &endpointv3.ClusterLoadAssignment{
+			ClusterName: grpcUnavailableClusterName,
+		},
+	}
+	setHTTP2ProtocolOptions(cluster)
+	return cluster
 }
 
 func (c *Controller) deleteGatewayResources(ctx context.Context, name, namespace string) error {
