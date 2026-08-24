@@ -25,10 +25,18 @@ const (
 	grpcUnavailableMessage      = "unavailable"
 )
 
+// grpcClusterName returns the HTTP/2 cluster name for a gRPC backend so it
+// does not share an HTTP/1.1 cluster with HTTPRoute.
 func grpcClusterName(clusterName string) string {
 	return clusterName + grpcClusterNameSuffix
 }
 
+// translateGRPCRouteToEnvoyRoutes translates a GRPCRoute into Envoy routes.
+// It returns the translated routes, the valid backend refs, and up to three conditions:
+//   - notAccepted: non-nil (Accepted=False) when the entire route is rejected
+//   - resolvedRefsFailure: non-nil (ResolvedRefs=False) only when a backend ref could not be resolved;
+//     nil signals success and the caller is responsible for setting ResolvedRefs=True
+//   - partiallyInvalid: non-nil (PartiallyInvalid=True) when some rules were dropped
 func translateGRPCRouteToEnvoyRoutes(
 	grpcRoute *gatewayv1.GRPCRoute,
 	serviceLister corev1listers.ServiceLister,
@@ -180,6 +188,8 @@ func translateGRPCRouteToEnvoyRoutes(
 	return envoyRoutes, allValidBackendRefs, nil, resolvedRefsFailure, partiallyInvalid
 }
 
+// findUnsupportedGRPCFilter returns the first filter type that this controller
+// does not implement. ExtensionRef is unsupported and causes the rule to be dropped.
 func findUnsupportedGRPCFilter(filters []gatewayv1.GRPCRouteFilter) (gatewayv1.GRPCRouteFilterType, bool) {
 	for _, filter := range filters {
 		switch filter.Type {
@@ -193,6 +203,8 @@ func findUnsupportedGRPCFilter(filters []gatewayv1.GRPCRouteFilter) (gatewayv1.G
 	return "", false
 }
 
+// applyGRPCUnavailableDirectResponse configures a gRPC UNAVAILABLE (status 14)
+// response. GEP-1016 requires this instead of HTTP 500 when no backend is usable.
 func applyGRPCUnavailableDirectResponse(route *routev3.Route) {
 	route.Action = &routev3.Route_DirectResponse{
 		DirectResponse: &routev3.DirectResponseAction{Status: 200},
@@ -214,6 +226,8 @@ func applyGRPCUnavailableDirectResponse(route *routev3.Route) {
 	)
 }
 
+// buildGRPCRouteAction returns an Envoy route action, the valid BackendRefs, and
+// a structured error. Invalid backends contribute weight to kind-grpc-unavailable.
 func buildGRPCRouteAction(namespace string, backendRefs []gatewayv1.GRPCBackendRef, serviceLister corev1listers.ServiceLister, referenceGrantLister gatewaylistersv1.ReferenceGrantLister) (*routev3.RouteAction, []gatewayv1.BackendRef, error) {
 	weightedClusters := &routev3.WeightedCluster{}
 	var validBackendRefs []gatewayv1.BackendRef
@@ -310,6 +324,8 @@ func buildGRPCRouteAction(namespace string, backendRefs []gatewayv1.GRPCBackendR
 	return action, validBackendRefs, firstErr
 }
 
+// buildGRPCRequestMirrors translates RequestMirror filters into Envoy request
+// mirror policies. Unresolvable mirror backends are skipped and reported.
 func buildGRPCRequestMirrors(
 	namespace string,
 	filters []gatewayv1.GRPCRouteFilter,
@@ -375,6 +391,8 @@ func buildGRPCRequestMirrors(
 	return policies, validBackendRefs, firstErr
 }
 
+// mirrorRuntimeFraction converts a Gateway API mirror fraction or percent into
+// Envoy RuntimeFractionalPercent.
 func mirrorRuntimeFraction(filter *gatewayv1.HTTPRequestMirrorFilter) *corev3.RuntimeFractionalPercent {
 	fp := &typev3.FractionalPercent{
 		Numerator:   100,
@@ -410,6 +428,8 @@ func mirrorRuntimeFraction(filter *gatewayv1.HTTPRequestMirrorFilter) *corev3.Ru
 	return &corev3.RuntimeFractionalPercent{DefaultValue: fp}
 }
 
+// grpcMethodMatchLengths returns service and method string lengths used for
+// GEP-1016 route precedence (longer match wins).
 func grpcMethodMatchLengths(method *gatewayv1.GRPCMethodMatch) (serviceLen, methodLen int) {
 	if method == nil {
 		return 0, 0
@@ -424,7 +444,8 @@ func grpcMethodMatchLengths(method *gatewayv1.GRPCMethodMatch) (serviceLen, meth
 }
 
 // translateGRPCRouteMatch translates a GRPCRouteMatch to an Envoy RouteMatch.
-// gRPC service/method maps to HTTP/2 path: /package.Service/Method
+// gRPC service/method maps to the HTTP/2 path /package.Service/Method.
+// Duplicate header match names are ignored after the first occurrence.
 func translateGRPCRouteMatch(match gatewayv1.GRPCRouteMatch) (*routev3.RouteMatch, *string) {
 	routeMatch := &routev3.RouteMatch{}
 

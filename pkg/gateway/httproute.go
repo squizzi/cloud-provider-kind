@@ -500,6 +500,8 @@ type routeSortMeta struct {
 	nsName     string
 }
 
+// setRouteSortMeta stores Gateway API precedence fields on the Envoy route so
+// sortRoutes can order HTTP and gRPC routes after they are merged.
 func setRouteSortMeta(route *routev3.Route, isGRPC bool, serviceLen, methodLen int, created metav1.Time, namespace, name string) {
 	if route == nil {
 		return
@@ -577,6 +579,8 @@ func sortRoutes(routes []*routev3.Route) {
 	})
 }
 
+// lessGRPCRoute implements GEP-1016 match precedence: longer service, then
+// longer method, then more headers, then older creation time, then namespace/name.
 func lessGRPCRoute(routeI, routeJ *routev3.Route, metaI, metaJ routeSortMeta) bool {
 	matchI := routeI.GetMatch()
 	matchJ := routeJ.GetMatch()

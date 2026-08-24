@@ -10,6 +10,9 @@ import (
 
 const httpGRPCHostnameConflictMessage = "hostname intersects a route of the other type on the same listener; the other route was preferred"
 
+// applyHTTPGRPCHostnameUniqueness enforces GEP-1016 hostname uniqueness between
+// HTTPRoute and GRPCRoute on the same listener. When hostnames overlap, the
+// older route is kept and the other route is rejected with Accepted=False.
 func applyHTTPGRPCHostnameUniqueness(
 	gateway *gatewayv1.Gateway,
 	httpByListener map[gatewayv1.SectionName][]*gatewayv1.HTTPRoute,

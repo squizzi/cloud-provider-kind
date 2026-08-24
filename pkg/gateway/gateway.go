@@ -43,6 +43,8 @@ import (
 )
 
 var (
+	// CloudProviderSupportedKinds is the set of route kinds this Gateway
+	// implementation accepts on HTTP and HTTPS listeners.
 	CloudProviderSupportedKinds = sets.New[gatewayv1.Kind](
 		"HTTPRoute",
 		"GRPCRoute",
@@ -657,6 +659,7 @@ func (c *Controller) getHTTPRoutesForGateway(gw *gatewayv1.Gateway) []*gatewayv1
 	return matchingRoutes
 }
 
+// getGRPCRoutesForGateway returns all GRPCRoutes that have a ParentRef pointing to the specified Gateway.
 func (c *Controller) getGRPCRoutesForGateway(gw *gatewayv1.Gateway) []*gatewayv1.GRPCRoute {
 	var matchingRoutes []*gatewayv1.GRPCRoute
 	allRoutes, err := c.grpcrouteLister.List(labels.Everything())
@@ -680,6 +683,9 @@ func (c *Controller) getGRPCRoutesForGateway(gw *gatewayv1.Gateway) []*gatewayv1
 	return matchingRoutes
 }
 
+// validateGRPCRoute iterates through all parentRefs of a GRPCRoute and generates
+// a complete RouteParentStatus for each one that targets the specified Gateway.
+// It also returns the listeners that accepted the route.
 func (c *Controller) validateGRPCRoute(
 	gateway *gatewayv1.Gateway,
 	grpcRoute *gatewayv1.GRPCRoute,
@@ -998,6 +1004,8 @@ func setHTTP2ProtocolOptions(cluster *clusterv3.Cluster) {
 	}
 }
 
+// applyGRPCCluster renames the cluster with the HTTP/2 suffix and enables HTTP/2
+// so gRPC upstreams are not mixed with HTTP/1.1 HTTPRoute clusters.
 func applyGRPCCluster(cluster *clusterv3.Cluster) {
 	if cluster == nil {
 		return
@@ -1009,6 +1017,8 @@ func applyGRPCCluster(cluster *clusterv3.Cluster) {
 	setHTTP2ProtocolOptions(cluster)
 }
 
+// newGRPCUnavailableCluster is the weighted-cluster target for invalid gRPC
+// backends. Combined with applyGRPCUnavailableDirectResponse, it yields UNAVAILABLE.
 func newGRPCUnavailableCluster() *clusterv3.Cluster {
 	cluster := &clusterv3.Cluster{
 		Name:                 grpcUnavailableClusterName,
