@@ -28,6 +28,7 @@ import (
 var supportedFeatures = buildSupportedFeatures(
 	// Core
 	features.SupportGateway,
+	features.SupportGRPCRoute,
 	features.SupportHTTPRoute,
 	features.SupportReferenceGrant,
 	// Extended

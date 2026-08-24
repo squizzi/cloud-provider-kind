@@ -89,32 +89,9 @@ func translateHTTPRouteToEnvoyRoutes(
 			}
 
 			if filter.Type == gatewayv1.HTTPRouteFilterRequestHeaderModifier && filter.RequestHeaderModifier != nil {
-				// Handle "set" actions (overwrite)
-				for _, header := range filter.RequestHeaderModifier.Set {
-					headersToAdd = append(headersToAdd, &corev3.HeaderValueOption{
-						Header: &corev3.HeaderValue{
-							Key:   string(header.Name),
-							Value: header.Value,
-						},
-						// This tells Envoy to overwrite the header if it exists.
-						AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
-					})
-				}
-
-				// Handle "add" actions (append)
-				for _, header := range filter.RequestHeaderModifier.Add {
-					headersToAdd = append(headersToAdd, &corev3.HeaderValueOption{
-						Header: &corev3.HeaderValue{
-							Key:   string(header.Name),
-							Value: header.Value,
-						},
-						// This tells Envoy to append the value if the header already exists.
-						AppendAction: corev3.HeaderValueOption_APPEND_IF_EXISTS_OR_ADD,
-					})
-				}
-
-				// Handle "remove" actions
-				headersToRemove = append(headersToRemove, filter.RequestHeaderModifier.Remove...)
+				add, remove := translateHTTPHeaderFilter(filter.RequestHeaderModifier)
+				headersToAdd = append(headersToAdd, add...)
+				headersToRemove = append(headersToRemove, remove...)
 			}
 		}
 
@@ -191,6 +168,35 @@ func translateHTTPRouteToEnvoyRoutes(
 		partiallyInvalid = &cond
 	}
 	return envoyRoutes, allValidBackendRefs, nil, resolvedRefsFailure, partiallyInvalid
+}
+
+// translateHTTPHeaderFilter converts a Gateway API HTTPHeaderFilter into Envoy
+// request header add and remove operations. Set overwrites an existing header.
+// Add appends to an existing header. Remove deletes the named headers.
+func translateHTTPHeaderFilter(filter *gatewayv1.HTTPHeaderFilter) (toAdd []*corev3.HeaderValueOption, toRemove []string) {
+	if filter == nil {
+		return nil, nil
+	}
+	for _, header := range filter.Set {
+		toAdd = append(toAdd, &corev3.HeaderValueOption{
+			Header: &corev3.HeaderValue{
+				Key:   string(header.Name),
+				Value: header.Value,
+			},
+			AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+		})
+	}
+	for _, header := range filter.Add {
+		toAdd = append(toAdd, &corev3.HeaderValueOption{
+			Header: &corev3.HeaderValue{
+				Key:   string(header.Name),
+				Value: header.Value,
+			},
+			AppendAction: corev3.HeaderValueOption_APPEND_IF_EXISTS_OR_ADD,
+		})
+	}
+	toRemove = append(toRemove, filter.Remove...)
+	return toAdd, toRemove
 }
 
 // findUnsupportedFilter returns the first filter type in the list that is not

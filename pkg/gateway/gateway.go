@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	clusterv3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
@@ -16,6 +17,7 @@ import (
 	endpointv3 "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	listenerv3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	httpv3 "github.com/envoyproxy/go-control-plane/envoy/extensions/upstreams/http/v3"
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	envoyproxytypes "github.com/envoyproxy/go-control-plane/pkg/cache/types"
 	cachev3 "github.com/envoyproxy/go-control-plane/pkg/cache/v3"
@@ -41,7 +43,7 @@ import (
 var (
 	CloudProviderSupportedKinds = sets.New[gatewayv1.Kind](
 		"HTTPRoute",
-		// "GRPCRoute",
+		"GRPCRoute",
 	)
 )
 
@@ -175,6 +177,7 @@ func (c *Controller) buildEnvoyResourcesForGateway(gateway *gatewayv1.Gateway) (
 	httpRouteStatuses := make(map[types.NamespacedName][]gatewayv1.RouteParentStatus)
 	grpcRouteStatuses := make(map[types.NamespacedName][]gatewayv1.RouteParentStatus)
 	routesByListener := make(map[gatewayv1.SectionName][]*gatewayv1.HTTPRoute)
+	grpcRoutesByListener := make(map[gatewayv1.SectionName][]*gatewayv1.GRPCRoute)
 
 	// Validate all HTTPRoutes against this Gateway
 	allHTTPRoutesForGateway := c.getHTTPRoutesForGateway(gateway)
@@ -194,6 +197,26 @@ func (c *Controller) buildEnvoyResourcesForGateway(gateway *gatewayv1.Gateway) (
 			for _, listener := range acceptingListeners {
 				if _, ok := processedListeners[listener.Name]; !ok {
 					routesByListener[listener.Name] = append(routesByListener[listener.Name], httpRoute)
+					processedListeners[listener.Name] = true
+				}
+			}
+		}
+	}
+
+	// Validate all GRPCRoutes against this Gateway
+	allGRPCRoutesForGateway := c.getGRPCRoutesForGateway(gateway)
+	for _, grpcRoute := range allGRPCRoutesForGateway {
+		key := types.NamespacedName{Name: grpcRoute.Name, Namespace: grpcRoute.Namespace}
+		parentStatuses, acceptingListeners := c.validateGRPCRoute(gateway, grpcRoute)
+
+		if len(parentStatuses) > 0 {
+			grpcRouteStatuses[key] = parentStatuses
+		}
+		if len(acceptingListeners) > 0 {
+			processedListeners := make(map[gatewayv1.SectionName]bool)
+			for _, listener := range acceptingListeners {
+				if _, ok := processedListeners[listener.Name]; !ok {
+					grpcRoutesByListener[listener.Name] = append(grpcRoutesByListener[listener.Name], grpcRoute)
 					processedListeners[listener.Name] = true
 				}
 			}
@@ -340,7 +363,56 @@ func (c *Controller) buildEnvoyResourcesForGateway(gateway *gatewayv1.Gateway) (
 					}
 				}
 
-				// TODO: Process GRPCRoutes
+				// Process GRPCRoutes
+				for _, grpcRoute := range grpcRoutesByListener[listener.Name] {
+					routes, validBackendRefs, notAccepted, resolvedRefsFailure, partiallyInvalidCond := translateGRPCRouteToEnvoyRoutes(grpcRoute, c.serviceLister, c.referenceGrantLister)
+
+					key := types.NamespacedName{Name: grpcRoute.Name, Namespace: grpcRoute.Namespace}
+					currentParentStatuses := grpcRouteStatuses[key]
+					for i := range currentParentStatuses {
+						if notAccepted != nil {
+							meta.SetStatusCondition(&currentParentStatuses[i].Conditions, *notAccepted)
+						}
+						if meta.IsStatusConditionTrue(currentParentStatuses[i].Conditions, string(gatewayv1.RouteConditionAccepted)) {
+							if resolvedRefsFailure != nil {
+								meta.SetStatusCondition(&currentParentStatuses[i].Conditions, *resolvedRefsFailure)
+							} else {
+								meta.SetStatusCondition(&currentParentStatuses[i].Conditions, createResolvedCondition(grpcRoute.Generation))
+							}
+							if partiallyInvalidCond != nil {
+								meta.SetStatusCondition(&currentParentStatuses[i].Conditions, *partiallyInvalidCond)
+							}
+						}
+					}
+					grpcRouteStatuses[key] = currentParentStatuses
+
+					for _, backendRef := range validBackendRefs {
+						cluster, err := c.translateBackendRefToCluster(grpcRoute.Namespace, backendRef)
+						if err == nil && cluster != nil {
+							setHTTP2ProtocolOptions(cluster)
+							if _, exists := envoyClusters[cluster.Name]; !exists {
+								envoyClusters[cluster.Name] = cluster
+							}
+						}
+					}
+
+					if routes != nil {
+						attachedRoutes++
+						vhostDomains := getIntersectingHostnames(listener, grpcRoute.Spec.Hostnames)
+						for _, domain := range vhostDomains {
+							vh, ok := virtualHostsForPort[domain]
+							if !ok {
+								vh = &routev3.VirtualHost{
+									Name:    fmt.Sprintf("%s-vh-%d-%s", gateway.Name, port, domain),
+									Domains: []string{domain},
+								}
+								virtualHostsForPort[domain] = vh
+							}
+							vh.Routes = append(vh.Routes, routes...)
+							klog.V(4).Infof("created VirtualHost %s for listener %s (grpc) with domain %s", vh.Name, listener.Name, domain)
+						}
+					}
+				}
 
 			default:
 				meta.SetStatusCondition(&listenerStatus.Conditions, metav1.Condition{
@@ -460,7 +532,7 @@ func getSupportedKinds(listener gatewayv1.Listener) ([]gatewayv1.RouteGroupKind,
 			}
 		}
 	} else if listener.Protocol == gatewayv1.HTTPProtocolType || listener.Protocol == gatewayv1.HTTPSProtocolType {
-		for _, kind := range CloudProviderSupportedKinds.UnsortedList() {
+		for _, kind := range sets.List(CloudProviderSupportedKinds) {
 			supportedKinds = append(supportedKinds,
 				gatewayv1.RouteGroupKind{
 					Group: &groupName,
@@ -519,7 +591,31 @@ func (c *Controller) updateRouteStatuses(
 		}
 	}
 
-	// TODO: Process GRPCRoutes (repeat the same logic)
+	// --- Process GRPCRoutes ---
+	for key, desiredParentStatuses := range grpcRouteStatuses {
+		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			originalRoute, err := c.grpcrouteLister.GRPCRoutes(key.Namespace).Get(key.Name)
+			if apierrors.IsNotFound(err) {
+				return nil
+			} else if err != nil {
+				return err
+			}
+
+			routeToUpdate := originalRoute.DeepCopy()
+			routeToUpdate.Status.Parents = desiredParentStatuses
+
+			if !semanticIgnoreLastTransitionTime.DeepEqual(originalRoute.Status, routeToUpdate.Status) {
+				_, updateErr := c.gwClient.GatewayV1().GRPCRoutes(routeToUpdate.Namespace).UpdateStatus(ctx, routeToUpdate, metav1.UpdateOptions{})
+				return updateErr
+			}
+
+			return nil
+		})
+
+		if err != nil {
+			errGroup = append(errGroup, fmt.Errorf("failed to update status for GRPCRoute %s: %w", key, err))
+		}
+	}
 
 	return errors.Join(errGroup...)
 }
@@ -547,6 +643,136 @@ func (c *Controller) getHTTPRoutesForGateway(gw *gatewayv1.Gateway) []*gatewayv1
 		}
 	}
 	return matchingRoutes
+}
+
+func (c *Controller) getGRPCRoutesForGateway(gw *gatewayv1.Gateway) []*gatewayv1.GRPCRoute {
+	var matchingRoutes []*gatewayv1.GRPCRoute
+	allRoutes, err := c.grpcrouteLister.List(labels.Everything())
+	if err != nil {
+		klog.Errorf("failed to list GRPCRoutes: %v", err)
+		return matchingRoutes
+	}
+
+	for _, route := range allRoutes {
+		for _, parentRef := range route.Spec.ParentRefs {
+			refNamespace := route.Namespace
+			if parentRef.Namespace != nil {
+				refNamespace = string(*parentRef.Namespace)
+			}
+			if parentRef.Name == gatewayv1.ObjectName(gw.Name) && refNamespace == gw.Namespace {
+				matchingRoutes = append(matchingRoutes, route)
+				break
+			}
+		}
+	}
+	return matchingRoutes
+}
+
+func (c *Controller) validateGRPCRoute(
+	gateway *gatewayv1.Gateway,
+	grpcRoute *gatewayv1.GRPCRoute,
+) ([]gatewayv1.RouteParentStatus, []gatewayv1.Listener) {
+	var parentStatuses []gatewayv1.RouteParentStatus
+	acceptedListenerSet := make(map[gatewayv1.SectionName]gatewayv1.Listener)
+
+	resolvedRefsCondition := metav1.Condition{
+		Type:               string(gatewayv1.RouteConditionResolvedRefs),
+		ObservedGeneration: grpcRoute.Generation,
+	}
+	if c.areGRPCBackendsValid(grpcRoute) {
+		resolvedRefsCondition.Status = metav1.ConditionTrue
+		resolvedRefsCondition.Reason = string(gatewayv1.RouteReasonResolvedRefs)
+		resolvedRefsCondition.Message = "All backend references have been resolved."
+	} else {
+		resolvedRefsCondition.Status = metav1.ConditionFalse
+		resolvedRefsCondition.Reason = string(gatewayv1.RouteReasonBackendNotFound)
+		resolvedRefsCondition.Message = "One or more backend references could not be found."
+	}
+
+	for _, parentRef := range grpcRoute.Spec.ParentRefs {
+		refNamespace := grpcRoute.Namespace
+		if parentRef.Namespace != nil {
+			refNamespace = string(*parentRef.Namespace)
+		}
+		if parentRef.Name != gatewayv1.ObjectName(gateway.Name) || refNamespace != gateway.Namespace {
+			continue
+		}
+
+		var listenersForThisRef []gatewayv1.Listener
+		rejectionReason := gatewayv1.RouteReasonNoMatchingParent
+
+		for _, listener := range gateway.Spec.Listeners {
+			sectionNameMatches := (parentRef.SectionName == nil) || (*parentRef.SectionName == listener.Name)
+			portMatches := (parentRef.Port == nil) || (*parentRef.Port == listener.Port)
+
+			if sectionNameMatches && portMatches {
+				if !isAllowedByListener(gateway, listener, grpcRoute, c.namespaceLister) {
+					rejectionReason = gatewayv1.RouteReasonNotAllowedByListeners
+					continue
+				}
+				if !isAllowedByHostname(listener, grpcRoute) {
+					rejectionReason = gatewayv1.RouteReasonNoMatchingListenerHostname
+					continue
+				}
+				listenersForThisRef = append(listenersForThisRef, listener)
+			}
+		}
+
+		status := gatewayv1.RouteParentStatus{
+			ParentRef:      parentRef,
+			ControllerName: controllerName,
+			Conditions:     []metav1.Condition{},
+		}
+
+		acceptedCondition := metav1.Condition{
+			Type:               string(gatewayv1.RouteConditionAccepted),
+			ObservedGeneration: grpcRoute.Generation,
+		}
+
+		if len(listenersForThisRef) == 0 {
+			acceptedCondition.Status = metav1.ConditionFalse
+			acceptedCondition.Reason = string(rejectionReason)
+			if rejectionReason == gatewayv1.RouteReasonNotAllowedByListeners {
+				acceptedCondition.Message = "Route is not allowed by a listener's policy."
+			} else {
+				acceptedCondition.Message = "The route's hostnames do not match any listener hostnames."
+			}
+		} else {
+			acceptedCondition.Status = metav1.ConditionTrue
+			acceptedCondition.Reason = string(gatewayv1.RouteReasonAccepted)
+			acceptedCondition.Message = "Route is accepted."
+			for _, l := range listenersForThisRef {
+				acceptedListenerSet[l.Name] = l
+			}
+		}
+
+		meta.SetStatusCondition(&status.Conditions, acceptedCondition)
+		meta.SetStatusCondition(&status.Conditions, resolvedRefsCondition)
+
+		parentStatuses = append(parentStatuses, status)
+	}
+
+	var allAcceptingListeners []gatewayv1.Listener
+	for _, l := range acceptedListenerSet {
+		allAcceptingListeners = append(allAcceptingListeners, l)
+	}
+
+	return parentStatuses, allAcceptingListeners
+}
+
+func (c *Controller) areGRPCBackendsValid(grpcRoute *gatewayv1.GRPCRoute) bool {
+	for _, rule := range grpcRoute.Spec.Rules {
+		for _, backendRef := range rule.BackendRefs {
+			ns := grpcRoute.Namespace
+			if backendRef.Namespace != nil {
+				ns = string(*backendRef.Namespace)
+			}
+			if _, err := c.serviceLister.Services(ns).Get(string(backendRef.Name)); err != nil {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // validateHTTPRoute is the definitive validation function. It iterates through all
@@ -737,6 +963,27 @@ func (c *Controller) translateBackendRefToCluster(defaultNamespace string, backe
 	}
 
 	return cluster, nil
+}
+
+// setHTTP2ProtocolOptions configures a cluster for HTTP/2 upstream connections.
+// gRPC requires HTTP/2; without this, Envoy defaults to HTTP/1.1.
+func setHTTP2ProtocolOptions(cluster *clusterv3.Cluster) {
+	h2Options, err := anypb.New(&httpv3.HttpProtocolOptions{
+		UpstreamProtocolOptions: &httpv3.HttpProtocolOptions_ExplicitHttpConfig_{
+			ExplicitHttpConfig: &httpv3.HttpProtocolOptions_ExplicitHttpConfig{
+				ProtocolConfig: &httpv3.HttpProtocolOptions_ExplicitHttpConfig_Http2ProtocolOptions{
+					Http2ProtocolOptions: &corev3.Http2ProtocolOptions{},
+				},
+			},
+		},
+	})
+	if err != nil {
+		klog.Errorf("failed to marshal HTTP/2 protocol options: %v", err)
+		return
+	}
+	cluster.TypedExtensionProtocolOptions = map[string]*anypb.Any{
+		"envoy.extensions.upstreams.http.v3.HttpProtocolOptions": h2Options,
+	}
 }
 
 func (c *Controller) deleteGatewayResources(ctx context.Context, name, namespace string) error {
