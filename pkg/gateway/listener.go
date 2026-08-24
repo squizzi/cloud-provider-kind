@@ -363,6 +363,11 @@ func (c *Controller) buildDownstreamTLSContext(ctx context.Context, gateway *gat
 
 	tlsContext := &tlsv3.DownstreamTlsContext{
 		CommonTlsContext: &tlsv3.CommonTlsContext{
+			// Advertise HTTP/2 via ALPN so terminated HTTPS listeners can
+			// negotiate h2 for gRPC (GRPCRoute), falling back to HTTP/1.1.
+			// The HTTP connection manager uses CodecType AUTO, which selects
+			// the protocol from the negotiated ALPN value.
+			AlpnProtocols:   []string{"h2", "http/1.1"},
 			TlsCertificates: []*tlsv3.TlsCertificate{},
 		},
 	}
