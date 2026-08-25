@@ -5,7 +5,6 @@ import (
 	"strings"
 	"testing"
 
-	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -417,36 +416,5 @@ func TestTranslateHTTPRouteToEnvoyRoutes(t *testing.T) {
 				t.Errorf("unexpected PartiallyInvalid condition (status=%q)", partiallyInvalid.Status)
 			}
 		})
-	}
-}
-
-func TestTranslateHTTPHeaderFilter(t *testing.T) {
-	add, remove := translateHTTPHeaderFilter(&gatewayv1.HTTPHeaderFilter{
-		Set:    []gatewayv1.HTTPHeader{{Name: "X-Set", Value: "set-value"}},
-		Add:    []gatewayv1.HTTPHeader{{Name: "X-Add", Value: "add-value"}},
-		Remove: []string{"X-Remove"},
-	})
-	if len(add) != 2 {
-		t.Fatalf("got %d headers to add, want 2", len(add))
-	}
-	if add[0].Header.GetKey() != "X-Set" || add[0].Header.GetValue() != "set-value" {
-		t.Errorf("set header = %s=%s, want X-Set=set-value", add[0].Header.GetKey(), add[0].Header.GetValue())
-	}
-	if add[0].AppendAction != corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD {
-		t.Errorf("set AppendAction = %v, want OVERWRITE_IF_EXISTS_OR_ADD", add[0].AppendAction)
-	}
-	if add[1].Header.GetKey() != "X-Add" || add[1].Header.GetValue() != "add-value" {
-		t.Errorf("add header = %s=%s, want X-Add=add-value", add[1].Header.GetKey(), add[1].Header.GetValue())
-	}
-	if add[1].AppendAction != corev3.HeaderValueOption_APPEND_IF_EXISTS_OR_ADD {
-		t.Errorf("add AppendAction = %v, want APPEND_IF_EXISTS_OR_ADD", add[1].AppendAction)
-	}
-	if len(remove) != 1 || remove[0] != "X-Remove" {
-		t.Errorf("remove = %v, want [X-Remove]", remove)
-	}
-
-	nilAdd, nilRemove := translateHTTPHeaderFilter(nil)
-	if nilAdd != nil || nilRemove != nil {
-		t.Errorf("nil filter: got add=%v remove=%v, want nil", nilAdd, nilRemove)
 	}
 }

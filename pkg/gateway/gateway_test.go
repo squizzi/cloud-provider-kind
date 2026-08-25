@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"reflect"
+	"sort"
 	"testing"
 
 	"k8s.io/utils/ptr"
@@ -109,6 +110,8 @@ func Test_getSupportedKinds(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got, got1 := getSupportedKinds(tt.args.listener)
+			sortRouteGroupKinds(got)
+			sortRouteGroupKinds(tt.want)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("getSupportedKinds() got = %v, want %v", got, tt.want)
 			}
@@ -117,4 +120,10 @@ func Test_getSupportedKinds(t *testing.T) {
 			}
 		})
 	}
+}
+
+func sortRouteGroupKinds(kinds []gatewayv1.RouteGroupKind) {
+	sort.Slice(kinds, func(i, j int) bool {
+		return kinds[i].Kind < kinds[j].Kind
+	})
 }

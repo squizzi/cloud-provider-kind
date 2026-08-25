@@ -447,7 +447,7 @@ func TestSortGRPCRoutesByServiceThenMethod(t *testing.T) {
 	setRouteSortMeta(short, true, 1, 2, metav1.Now(), "default", "short")
 	setRouteSortMeta(long, true, 6, 1, metav1.Now(), "default", "long")
 	routes := []*routev3.Route{short, long}
-	sortRoutes(routes)
+	sortGRPCRoutes(routes)
 	if routes[0].Name != "long" {
 		t.Errorf("first route = %q, want long (longer service wins)", routes[0].Name)
 	}
@@ -498,5 +498,10 @@ func TestHTTPGRPCHostnameUniquenessPrefersOldest(t *testing.T) {
 	}
 	if meta.IsStatusConditionTrue(httpStatus[types.NamespacedName{Namespace: "default", Name: "http"}][0].Conditions, string(gatewayv1.RouteConditionAccepted)) {
 		t.Error("HTTPRoute should have Accepted=False after hostname conflict")
+	}
+	got := meta.FindStatusCondition(httpStatus[types.NamespacedName{Namespace: "default", Name: "http"}][0].Conditions, string(gatewayv1.RouteConditionAccepted))
+	want := hostnameConflictMessage("GRPCRoute", "default", "grpc")
+	if got == nil || got.Message != want {
+		t.Errorf("HTTPRoute conflict message = %v, want %q", got, want)
 	}
 }

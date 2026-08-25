@@ -10,7 +10,6 @@ import (
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	"google.golang.org/protobuf/types/known/anypb"
-	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -171,9 +170,32 @@ func translateHTTPRouteToEnvoyRoutes(
 			}
 
 			if filter.Type == gatewayv1.HTTPRouteFilterRequestHeaderModifier && filter.RequestHeaderModifier != nil {
-				add, remove := translateHTTPHeaderFilter(filter.RequestHeaderModifier)
-				headersToAdd = append(headersToAdd, add...)
-				headersToRemove = append(headersToRemove, remove...)
+				// Handle "set" actions (overwrite)
+				for _, header := range filter.RequestHeaderModifier.Set {
+					headersToAdd = append(headersToAdd, &corev3.HeaderValueOption{
+						Header: &corev3.HeaderValue{
+							Key:   string(header.Name),
+							Value: header.Value,
+						},
+						// This tells Envoy to overwrite the header if it exists.
+						AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+					})
+				}
+
+				// Handle "add" actions (append)
+				for _, header := range filter.RequestHeaderModifier.Add {
+					headersToAdd = append(headersToAdd, &corev3.HeaderValueOption{
+						Header: &corev3.HeaderValue{
+							Key:   string(header.Name),
+							Value: header.Value,
+						},
+						// This tells Envoy to append the value if the header already exists.
+						AppendAction: corev3.HeaderValueOption_APPEND_IF_EXISTS_OR_ADD,
+					})
+				}
+
+				// Handle "remove" actions
+				headersToRemove = append(headersToRemove, filter.RequestHeaderModifier.Remove...)
 			}
 		}
 
@@ -186,7 +208,6 @@ func translateHTTPRouteToEnvoyRoutes(
 			envoyRoute.RequestHeadersToAdd = headersToAdd
 			envoyRoute.RequestHeadersToRemove = headersToRemove
 			envoyRoute.TypedPerFilterConfig = extAuthPerRoute
-			setRouteSortMeta(envoyRoute, false, 0, 0, httpRoute.CreationTimestamp, httpRoute.Namespace, httpRoute.Name)
 
 			if redirectAction != nil {
 				// If this is a redirect, set the Redirect action. No backends are needed.
@@ -239,35 +260,6 @@ func translateHTTPRouteToEnvoyRoutes(
 		result.partiallyInvalid = &cond
 	}
 	return result
-}
-
-// translateHTTPHeaderFilter converts a Gateway API HTTPHeaderFilter into Envoy
-// request header add and remove operations. Set overwrites an existing header.
-// Add appends to an existing header. Remove deletes the named headers.
-func translateHTTPHeaderFilter(filter *gatewayv1.HTTPHeaderFilter) (toAdd []*corev3.HeaderValueOption, toRemove []string) {
-	if filter == nil {
-		return nil, nil
-	}
-	for _, header := range filter.Set {
-		toAdd = append(toAdd, &corev3.HeaderValueOption{
-			Header: &corev3.HeaderValue{
-				Key:   string(header.Name),
-				Value: header.Value,
-			},
-			AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
-		})
-	}
-	for _, header := range filter.Add {
-		toAdd = append(toAdd, &corev3.HeaderValueOption{
-			Header: &corev3.HeaderValue{
-				Key:   string(header.Name),
-				Value: header.Value,
-			},
-			AppendAction: corev3.HeaderValueOption_APPEND_IF_EXISTS_OR_ADD,
-		})
-	}
-	toRemove = append(toRemove, filter.Remove...)
-	return toAdd, toRemove
 }
 
 // findUnsupportedFilter returns the first filter type in the list that is not
@@ -490,164 +482,54 @@ func createPartiallyInvalidCondition(message string, generation int64) metav1.Co
 	}
 }
 
-const routeSortMetadataKey = "cloud-provider-kind.gateway"
-
-type routeSortMeta struct {
-	isGRPC     bool
-	serviceLen int
-	methodLen  int
-	created    int64
-	nsName     string
-}
-
-// setRouteSortMeta stores Gateway API precedence fields on the Envoy route so
-// sortRoutes can order HTTP and gRPC routes after they are merged.
-func setRouteSortMeta(route *routev3.Route, isGRPC bool, serviceLen, methodLen int, created metav1.Time, namespace, name string) {
-	if route == nil {
-		return
-	}
-	st, err := structpb.NewStruct(map[string]interface{}{
-		"grpc":        isGRPC,
-		"service_len": serviceLen,
-		"method_len":  methodLen,
-		"created":     created.UnixMicro(),
-		"ns_name":     namespace + "/" + name,
-	})
-	if err != nil {
-		return
-	}
-	route.Metadata = &corev3.Metadata{
-		FilterMetadata: map[string]*structpb.Struct{
-			routeSortMetadataKey: st,
-		},
-	}
-}
-
-func getRouteSortMeta(route *routev3.Route) routeSortMeta {
-	if route == nil || route.Metadata == nil {
-		return routeSortMeta{}
-	}
-	st := route.Metadata.FilterMetadata[routeSortMetadataKey]
-	if st == nil {
-		return routeSortMeta{}
-	}
-	fields := st.Fields
-	meta := routeSortMeta{}
-	if v, ok := fields["grpc"]; ok {
-		meta.isGRPC = v.GetBoolValue()
-	}
-	if v, ok := fields["service_len"]; ok {
-		meta.serviceLen = int(v.GetNumberValue())
-	}
-	if v, ok := fields["method_len"]; ok {
-		meta.methodLen = int(v.GetNumberValue())
-	}
-	if v, ok := fields["created"]; ok {
-		meta.created = int64(v.GetNumberValue())
-	}
-	if v, ok := fields["ns_name"]; ok {
-		meta.nsName = v.GetStringValue()
-	}
-	return meta
-}
-
-func compareRouteMetaTieBreak(a, b routeSortMeta) int {
-	if a.created != b.created {
-		if a.created < b.created {
-			return -1
-		}
-		return 1
-	}
-	if a.nsName != b.nsName {
-		if a.nsName < b.nsName {
-			return -1
-		}
-		return 1
-	}
-	return 0
-}
-
 // sortRoutes is the definitive sorter for Envoy routes based on Gateway API precedence.
 func sortRoutes(routes []*routev3.Route) {
-	sort.SliceStable(routes, func(i, j int) bool {
-		metaI := getRouteSortMeta(routes[i])
-		metaJ := getRouteSortMeta(routes[j])
-		if metaI.isGRPC && metaJ.isGRPC {
-			return lessGRPCRoute(routes[i], routes[j], metaI, metaJ)
+	sort.Slice(routes, func(i, j int) bool {
+		matchI := routes[i].GetMatch()
+		matchJ := routes[j].GetMatch()
+
+		// De-prioritize the catch-all route, ensuring it's always last.
+		isCatchAllI := isCatchAll(matchI)
+		isCatchAllJ := isCatchAll(matchJ)
+
+		if isCatchAllI != isCatchAllJ {
+			// If I is the catch-all, it should come after J (return false).
+			// If J is the catch-all, it should come after I (return true).
+			return isCatchAllJ
 		}
-		return lessHTTPRoute(routes[i], routes[j], metaI, metaJ)
+
+		// Precedence Rule 1: Exact Path Match vs. Other Path Matches
+		isExactPathI := matchI.GetPath() != ""
+		isExactPathJ := matchJ.GetPath() != ""
+		if isExactPathI != isExactPathJ {
+			return isExactPathI // Exact path is higher precedence
+		}
+
+		// Precedence Rule 2: Longest Prefix Match
+		prefixI := getPathMatchValue(matchI)
+		prefixJ := getPathMatchValue(matchJ)
+
+		if len(prefixI) != len(prefixJ) {
+			return len(prefixI) > len(prefixJ) // Longer prefix is higher precedence
+		}
+
+		// Precedence Rule 3: Number of Header Matches
+		headerCountI := len(matchI.GetHeaders())
+		headerCountJ := len(matchJ.GetHeaders())
+		if headerCountI != headerCountJ {
+			return headerCountI > headerCountJ // More headers is higher precedence
+		}
+
+		// Precedence Rule 4: Number of Query Param Matches
+		queryCountI := len(matchI.GetQueryParameters())
+		queryCountJ := len(matchJ.GetQueryParameters())
+		if queryCountI != queryCountJ {
+			return queryCountI > queryCountJ // More query params is higher precedence
+		}
+
+		// If all else is equal, maintain original order (stable sort)
+		return false
 	})
-}
-
-// lessGRPCRoute implements GEP-1016 match precedence: longer service, then
-// longer method, then more headers, then older creation time, then namespace/name.
-func lessGRPCRoute(routeI, routeJ *routev3.Route, metaI, metaJ routeSortMeta) bool {
-	matchI := routeI.GetMatch()
-	matchJ := routeJ.GetMatch()
-
-	isCatchAllI := isCatchAll(matchI)
-	isCatchAllJ := isCatchAll(matchJ)
-	if isCatchAllI != isCatchAllJ {
-		return isCatchAllJ
-	}
-	if metaI.serviceLen != metaJ.serviceLen {
-		return metaI.serviceLen > metaJ.serviceLen
-	}
-	if metaI.methodLen != metaJ.methodLen {
-		return metaI.methodLen > metaJ.methodLen
-	}
-	headerCountI := len(matchI.GetHeaders())
-	headerCountJ := len(matchJ.GetHeaders())
-	if headerCountI != headerCountJ {
-		return headerCountI > headerCountJ
-	}
-	return compareRouteMetaTieBreak(metaI, metaJ) < 0
-}
-
-func lessHTTPRoute(routeI, routeJ *routev3.Route, metaI, metaJ routeSortMeta) bool {
-	matchI := routeI.GetMatch()
-	matchJ := routeJ.GetMatch()
-
-	// De-prioritize the catch-all route, ensuring it's always last.
-	isCatchAllI := isCatchAll(matchI)
-	isCatchAllJ := isCatchAll(matchJ)
-
-	if isCatchAllI != isCatchAllJ {
-		// If I is the catch-all, it should come after J (return false).
-		// If J is the catch-all, it should come after I (return true).
-		return isCatchAllJ
-	}
-
-	// Precedence Rule 1: Exact Path Match vs. Other Path Matches
-	isExactPathI := matchI.GetPath() != ""
-	isExactPathJ := matchJ.GetPath() != ""
-	if isExactPathI != isExactPathJ {
-		return isExactPathI // Exact path is higher precedence
-	}
-
-	// Precedence Rule 2: Longest Prefix Match
-	prefixI := getPathMatchValue(matchI)
-	prefixJ := getPathMatchValue(matchJ)
-
-	if len(prefixI) != len(prefixJ) {
-		return len(prefixI) > len(prefixJ) // Longer prefix is higher precedence
-	}
-
-	// Precedence Rule 3: Number of Header Matches
-	headerCountI := len(matchI.GetHeaders())
-	headerCountJ := len(matchJ.GetHeaders())
-	if headerCountI != headerCountJ {
-		return headerCountI > headerCountJ // More headers is higher precedence
-	}
-
-	// Precedence Rule 4: Number of Query Param Matches
-	queryCountI := len(matchI.GetQueryParameters())
-	queryCountJ := len(matchJ.GetQueryParameters())
-	if queryCountI != queryCountJ {
-		return queryCountI > queryCountJ // More query params is higher precedence
-	}
-
-	return compareRouteMetaTieBreak(metaI, metaJ) < 0
 }
 
 // getPathMatchValue is a helper to extract the path string for comparison.

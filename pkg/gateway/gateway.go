@@ -43,8 +43,6 @@ import (
 )
 
 var (
-	// CloudProviderSupportedKinds is the set of route kinds this Gateway
-	// implementation accepts on HTTP and HTTPS listeners.
 	CloudProviderSupportedKinds = sets.New[gatewayv1.Kind](
 		"HTTPRoute",
 		"GRPCRoute",
@@ -441,7 +439,11 @@ func (c *Controller) buildEnvoyResourcesForGateway(gateway *gatewayv1.Gateway) (
 
 		allVirtualHosts := make([]*routev3.VirtualHost, 0, len(virtualHostsForPort))
 		for _, vh := range virtualHostsForPort {
-			sortRoutes(vh.Routes)
+			if virtualHostHasGRPCRoutes(vh.Routes) {
+				sortGRPCRoutes(vh.Routes)
+			} else {
+				sortRoutes(vh.Routes)
+			}
 			allVirtualHosts = append(allVirtualHosts, vh)
 		}
 
@@ -546,7 +548,7 @@ func getSupportedKinds(listener gatewayv1.Listener) ([]gatewayv1.RouteGroupKind,
 			}
 		}
 	} else if listener.Protocol == gatewayv1.HTTPProtocolType || listener.Protocol == gatewayv1.HTTPSProtocolType {
-		for _, kind := range sets.List(CloudProviderSupportedKinds) {
+		for _, kind := range CloudProviderSupportedKinds.UnsortedList() {
 			supportedKinds = append(supportedKinds,
 				gatewayv1.RouteGroupKind{
 					Group: &groupName,

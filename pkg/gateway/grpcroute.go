@@ -3,12 +3,14 @@ package gateway
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	corev3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	routev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
 	matcherv3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
 	typev3 "github.com/envoyproxy/go-control-plane/envoy/type/v3"
+	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -545,4 +547,146 @@ func translateGRPCRouteMatch(match gatewayv1.GRPCRouteMatch) (*routev3.RouteMatc
 	}
 
 	return routeMatch, nil
+}
+
+// translateHTTPHeaderFilter converts a Gateway API HTTPHeaderFilter into Envoy
+// header add and remove operations. Set overwrites an existing header. Add
+// appends to an existing header. Remove deletes the named headers.
+func translateHTTPHeaderFilter(filter *gatewayv1.HTTPHeaderFilter) (toAdd []*corev3.HeaderValueOption, toRemove []string) {
+	if filter == nil {
+		return nil, nil
+	}
+	for _, header := range filter.Set {
+		toAdd = append(toAdd, &corev3.HeaderValueOption{
+			Header: &corev3.HeaderValue{
+				Key:   string(header.Name),
+				Value: header.Value,
+			},
+			AppendAction: corev3.HeaderValueOption_OVERWRITE_IF_EXISTS_OR_ADD,
+		})
+	}
+	for _, header := range filter.Add {
+		toAdd = append(toAdd, &corev3.HeaderValueOption{
+			Header: &corev3.HeaderValue{
+				Key:   string(header.Name),
+				Value: header.Value,
+			},
+			AppendAction: corev3.HeaderValueOption_APPEND_IF_EXISTS_OR_ADD,
+		})
+	}
+	toRemove = append(toRemove, filter.Remove...)
+	return toAdd, toRemove
+}
+
+const routeSortMetadataKey = "cloud-provider-kind.gateway"
+
+type routeSortMeta struct {
+	isGRPC     bool
+	serviceLen int
+	methodLen  int
+	created    int64
+	nsName     string
+}
+
+func setRouteSortMeta(route *routev3.Route, isGRPC bool, serviceLen, methodLen int, created metav1.Time, namespace, name string) {
+	if route == nil {
+		return
+	}
+	st, err := structpb.NewStruct(map[string]interface{}{
+		"grpc":        isGRPC,
+		"service_len": serviceLen,
+		"method_len":  methodLen,
+		"created":     created.UnixMicro(),
+		"ns_name":     namespace + "/" + name,
+	})
+	if err != nil {
+		return
+	}
+	route.Metadata = &corev3.Metadata{
+		FilterMetadata: map[string]*structpb.Struct{
+			routeSortMetadataKey: st,
+		},
+	}
+}
+
+func getRouteSortMeta(route *routev3.Route) routeSortMeta {
+	if route == nil || route.Metadata == nil {
+		return routeSortMeta{}
+	}
+	st := route.Metadata.FilterMetadata[routeSortMetadataKey]
+	if st == nil {
+		return routeSortMeta{}
+	}
+	fields := st.Fields
+	meta := routeSortMeta{}
+	if v, ok := fields["grpc"]; ok {
+		meta.isGRPC = v.GetBoolValue()
+	}
+	if v, ok := fields["service_len"]; ok {
+		meta.serviceLen = int(v.GetNumberValue())
+	}
+	if v, ok := fields["method_len"]; ok {
+		meta.methodLen = int(v.GetNumberValue())
+	}
+	if v, ok := fields["created"]; ok {
+		meta.created = int64(v.GetNumberValue())
+	}
+	if v, ok := fields["ns_name"]; ok {
+		meta.nsName = v.GetStringValue()
+	}
+	return meta
+}
+
+func compareRouteMetaTieBreak(a, b routeSortMeta) int {
+	if a.created != b.created {
+		if a.created < b.created {
+			return -1
+		}
+		return 1
+	}
+	if a.nsName != b.nsName {
+		if a.nsName < b.nsName {
+			return -1
+		}
+		return 1
+	}
+	return 0
+}
+
+func virtualHostHasGRPCRoutes(routes []*routev3.Route) bool {
+	for _, route := range routes {
+		if getRouteSortMeta(route).isGRPC {
+			return true
+		}
+	}
+	return false
+}
+
+func sortGRPCRoutes(routes []*routev3.Route) {
+	sort.SliceStable(routes, func(i, j int) bool {
+		return lessGRPCRoute(routes[i], routes[j], getRouteSortMeta(routes[i]), getRouteSortMeta(routes[j]))
+	})
+}
+
+func lessGRPCRoute(routeI, routeJ *routev3.Route, metaI, metaJ routeSortMeta) bool {
+	matchI := routeI.GetMatch()
+	matchJ := routeJ.GetMatch()
+
+	isCatchAllI := isCatchAll(matchI)
+	isCatchAllJ := isCatchAll(matchJ)
+	if isCatchAllI != isCatchAllJ {
+		return isCatchAllJ
+	}
+	if metaI.serviceLen != metaJ.serviceLen {
+		return metaI.serviceLen > metaJ.serviceLen
+	}
+	if metaI.methodLen != metaJ.methodLen {
+		return metaI.methodLen > metaJ.methodLen
+	}
+	headerCountI := len(matchI.GetHeaders())
+	headerCountJ := len(matchJ.GetHeaders())
+	if headerCountI != headerCountJ {
+		return headerCountI > headerCountJ
+	}
+	return compareRouteMetaTieBreak(metaI, metaJ) < 0
 }
