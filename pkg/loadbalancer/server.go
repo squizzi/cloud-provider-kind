@@ -269,7 +269,7 @@ func (s *Server) createLoadBalancer(clusterName string, service *v1.Service, ima
 	klog.V(2).Infof("creating loadbalancer with parameters: %v", args)
 	err := container.Create(name, args)
 	if err != nil {
-		return fmt.Errorf("failed to create continers %s %v: %w", name, args, err)
+		return fmt.Errorf("failed to create containers %s %v: %w", name, args, err)
 	}
 
 	return nil
