@@ -114,11 +114,11 @@ metadata:
 spec:
   selector:
     matchLabels:
-      app: MyApp
+      app: MultiAuthApp
   template:
     metadata:
       labels:
-        app: MyApp
+        app: MultiAuthApp
     spec:
       containers:
       - name: myapp
@@ -133,7 +133,7 @@ metadata:
   name: myapp-svc
 spec:
   selector:
-    app: MyApp
+    app: MultiAuthApp
   ports:
   - port: 8080
     targetPort: 80

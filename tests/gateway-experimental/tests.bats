@@ -27,17 +27,37 @@ http_status() {
     echo "000"
 }
 
+# wait_no_pods returns once no pods match the selector. kubectl delete of a
+# Deployment is background-cascaded, so leftover pods from a previous test can
+# still be terminating when the next test waits on the same labels.
+wait_no_pods() {
+    local selector="$1" i
+    for ((i = 0; i < 60; i++)); do
+        [[ -z $(kubectl get pods -l "$selector" -o name --no-headers 2>/dev/null) ]] && return 0
+        sleep 1
+    done
+    echo "Timeout waiting for pods with $selector to be gone" >&2
+    kubectl get pods -l "$selector" >&2 || true
+    return 1
+}
+
 # apply_multi_auth brings up two authorization servers, a backend and the routes
 # that use them, then waits for every pod to be ready.
 apply_multi_auth() {
+    wait_no_pods app=MultiAuthApp
+    wait_no_pods app=AuthzA
+    wait_no_pods app=AuthzB
     kubectl apply -f "$BATS_TEST_DIRNAME"/manifests/multi_auth.yaml
-    kubectl wait --for=condition=ready pods -l app=MyApp --timeout=120s
+    kubectl wait --for=condition=ready pods -l app=MultiAuthApp --timeout=120s
     kubectl wait --for=condition=ready pods -l app=AuthzA --timeout=120s
     kubectl wait --for=condition=ready pods -l app=AuthzB --timeout=120s
 }
 
 delete_multi_auth() {
     kubectl delete --ignore-not-found -f "$BATS_TEST_DIRNAME"/manifests/multi_auth.yaml
+    wait_no_pods app=MultiAuthApp
+    wait_no_pods app=AuthzA
+    wait_no_pods app=AuthzB
 }
 
 # wait_for_feature waits until the GatewayClass advertises a feature. The name is
@@ -79,6 +99,8 @@ wait_for_feature() {
     [ "$HOSTNAME" = "$POD" ]
 
     kubectl delete --ignore-not-found -f "$BATS_TEST_DIRNAME"/../../examples/gateway_external_auth.yaml
+    wait_no_pods app=MyApp
+    wait_no_pods app=Authz
 }
 
 @test "ExternalAuth filter with an unresolvable backendRef fails closed" {
