@@ -32,6 +32,7 @@ import (
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
 
+	corev1 "k8s.io/api/core/v1"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewaylistersv1 "sigs.k8s.io/gateway-api/pkg/client/listers/apis/v1"
@@ -128,14 +129,32 @@ func resolveExternalAuthBackend(
 		}
 	}
 
-	if _, err := serviceLister.Services(ns).Get(string(backendRef.Name)); err != nil {
+	svc, err := serviceLister.Services(ns).Get(string(backendRef.Name))
+	if err != nil {
 		return "", &ControllerError{
 			Reason:  string(gatewayv1.RouteReasonBackendNotFound),
 			Message: fmt.Sprintf("externalAuth backend Service %s/%s not found", ns, backendRef.Name),
 		}
 	}
+	port := int32(*backendRef.Port)
+	if !serviceHasPort(svc, port) {
+		return "", &ControllerError{
+			Reason:  string(gatewayv1.RouteReasonBackendNotFound),
+			Message: fmt.Sprintf("externalAuth backend Service %s/%s does not have port %d", ns, backendRef.Name, port),
+		}
+	}
 
-	return externalAuthClusterName(ns, string(backendRef.Name), int32(*backendRef.Port)), nil
+	return externalAuthClusterName(ns, string(backendRef.Name), port), nil
+}
+
+// serviceHasPort reports whether svc exposes the given Service port.
+func serviceHasPort(svc *corev1.Service, port int32) bool {
+	for _, p := range svc.Spec.Ports {
+		if p.Port == port {
+			return true
+		}
+	}
+	return false
 }
 
 // externalAuthClusterName returns the Envoy cluster name for an authorization server.

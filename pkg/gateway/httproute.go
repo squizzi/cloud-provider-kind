@@ -75,6 +75,8 @@ func translateHTTPRouteToEnvoyRoutes(
 ) routeTranslationResult {
 	var result routeTranslationResult
 	var droppedRuleMessages []string
+	var invalidExtAuthMessages []string
+	validRules := 0
 
 	for ruleIndex, rule := range httpRoute.Spec.Rules {
 		if unsupportedType, found := findUnsupportedFilter(rule.Filters); found {
@@ -104,6 +106,8 @@ func translateHTTPRouteToEnvoyRoutes(
 			}
 			cond := createNotResolvedCondition(reason, extAuthErr.Error(), httpRoute.Generation)
 			result.resolvedRefsFailure = &cond
+			invalidExtAuthMessages = append(invalidExtAuthMessages,
+				fmt.Sprintf("rule[%d]: %s", ruleIndex, extAuthErr.Error()))
 
 			// The rule still claims its matches, otherwise the request would
 			// fall through to a lower precedence route that has no authorization.
@@ -118,6 +122,7 @@ func translateHTTPRouteToEnvoyRoutes(
 			}
 			continue
 		}
+		validRules++
 
 		var extAuthPerRoute map[string]*anypb.Any
 		if len(extAuth) > 0 {
@@ -245,6 +250,12 @@ func translateHTTPRouteToEnvoyRoutes(
 
 	if len(droppedRuleMessages) > 0 {
 		msg := fmt.Sprintf("Dropped Rule(s): %s", strings.Join(droppedRuleMessages, "; "))
+		cond := createPartiallyInvalidCondition(msg, httpRoute.Generation)
+		result.partiallyInvalid = &cond
+	} else if len(invalidExtAuthMessages) > 0 && validRules > 0 {
+		// Some rules resolved and some did not: the route is still Accepted, but
+		// the invalid ExternalAuth rules must be reported as PartiallyInvalid.
+		msg := fmt.Sprintf("Dropped Rule(s): %s", strings.Join(invalidExtAuthMessages, "; "))
 		cond := createPartiallyInvalidCondition(msg, httpRoute.Generation)
 		result.partiallyInvalid = &cond
 	}

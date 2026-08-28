@@ -87,6 +87,11 @@ func TestResolveExternalAuthBackend(t *testing.T) {
 			wantReason: string(gatewayv1.RouteReasonBackendNotFound),
 		},
 		{
+			name:       "existing service, missing port",
+			extAuth:    httpExternalAuth("", "authz", 9999),
+			wantReason: string(gatewayv1.RouteReasonBackendNotFound),
+		},
+		{
 			name: "unsupported kind",
 			extAuth: func() *gatewayv1.HTTPExternalAuthFilter {
 				e := httpExternalAuth("", "authz", 9000)
@@ -322,6 +327,98 @@ func TestTranslateHTTPRouteWithExternalAuth(t *testing.T) {
 	}
 	if _, ok := got.routes[0].Action.(*routev3.Route_Route); !ok {
 		t.Errorf("expected a forwarding action, got %T", got.routes[0].Action)
+	}
+}
+
+func TestTranslateHTTPRouteWithExternalAuthInvalidPort(t *testing.T) {
+	svcLister := newMockServiceLister(makeService("default", "svc", 80), makeService("default", "authz", 9000))
+	noGrants := newFakeReferenceGrantLister(nil, nil)
+
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "route", Generation: 1},
+		Spec: gatewayv1.HTTPRouteSpec{
+			Rules: []gatewayv1.HTTPRouteRule{makeRuleWithFilters(externalAuthFilter(httpExternalAuth("", "authz", 9999)))},
+		},
+	}
+
+	got := translateHTTPRouteToEnvoyRoutes(route, svcLister, noGrants)
+	if got.resolvedRefsFailure == nil {
+		t.Fatal("expected ResolvedRefs=False when the authorization server port does not exist")
+	}
+	if got.resolvedRefsFailure.Reason != string(gatewayv1.RouteReasonBackendNotFound) {
+		t.Errorf("got reason %q, want %q", got.resolvedRefsFailure.Reason, gatewayv1.RouteReasonBackendNotFound)
+	}
+	if got.partiallyInvalid != nil {
+		t.Errorf("a single invalid ExternalAuth rule must not set PartiallyInvalid, got %v", got.partiallyInvalid.Message)
+	}
+	if len(got.routes) != 1 {
+		t.Fatalf("got %d routes, want 1", len(got.routes))
+	}
+	direct, ok := got.routes[0].Action.(*routev3.Route_DirectResponse)
+	if !ok {
+		t.Fatalf("expected the request to fail closed, got %T", got.routes[0].Action)
+	}
+	if direct.DirectResponse.Status != 500 {
+		t.Errorf("got status %d, want 500", direct.DirectResponse.Status)
+	}
+}
+
+func TestTranslateHTTPRouteWithMixedExternalAuthValidity(t *testing.T) {
+	svcLister := newMockServiceLister(
+		makeService("default", "svc", 80),
+		makeAuthService("default", "authz", 9000, "10.0.0.10"),
+	)
+	noGrants := newFakeReferenceGrantLister(nil, nil)
+
+	valid := makeRuleWithFilters(externalAuthFilter(httpExternalAuth("", "authz", 9000)))
+	valid.Matches = []gatewayv1.HTTPRouteMatch{{
+		Path: &gatewayv1.HTTPPathMatch{
+			Type:  ptr.To(gatewayv1.PathMatchPathPrefix),
+			Value: ptr.To("/external-auth/valid"),
+		},
+	}}
+	invalid := makeRuleWithFilters(externalAuthFilter(httpExternalAuth("", "missing", 9000)))
+	invalid.Matches = []gatewayv1.HTTPRouteMatch{{
+		Path: &gatewayv1.HTTPPathMatch{
+			Type:  ptr.To(gatewayv1.PathMatchPathPrefix),
+			Value: ptr.To("/external-auth/invalid"),
+		},
+	}}
+
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "route", Generation: 1},
+		Spec: gatewayv1.HTTPRouteSpec{
+			Rules: []gatewayv1.HTTPRouteRule{valid, invalid},
+		},
+	}
+
+	got := translateHTTPRouteToEnvoyRoutes(route, svcLister, noGrants)
+	if got.notAccepted != nil {
+		t.Fatalf("route was rejected: %v", got.notAccepted.Message)
+	}
+	if got.resolvedRefsFailure == nil {
+		t.Fatal("expected ResolvedRefs=False when one ExternalAuth backend cannot be resolved")
+	}
+	if got.resolvedRefsFailure.Reason != string(gatewayv1.RouteReasonBackendNotFound) {
+		t.Errorf("got reason %q, want %q", got.resolvedRefsFailure.Reason, gatewayv1.RouteReasonBackendNotFound)
+	}
+	if got.partiallyInvalid == nil {
+		t.Fatal("expected PartiallyInvalid=True when one ExternalAuth rule is valid and another is not")
+	}
+	if got.partiallyInvalid.Reason != string(gatewayv1.RouteReasonUnsupportedValue) {
+		t.Errorf("got PartiallyInvalid reason %q, want %q", got.partiallyInvalid.Reason, gatewayv1.RouteReasonUnsupportedValue)
+	}
+	if !strings.HasPrefix(got.partiallyInvalid.Message, "Dropped Rule") {
+		t.Errorf("PartiallyInvalid.Message = %q, want prefix \"Dropped Rule\"", got.partiallyInvalid.Message)
+	}
+	if len(got.routes) != 2 {
+		t.Fatalf("got %d routes, want 2", len(got.routes))
+	}
+	if _, ok := got.routes[0].Action.(*routev3.Route_Route); !ok {
+		t.Errorf("the valid rule must still forward, got %T", got.routes[0].Action)
+	}
+	if _, ok := got.routes[1].Action.(*routev3.Route_DirectResponse); !ok {
+		t.Errorf("the invalid rule must fail closed, got %T", got.routes[1].Action)
 	}
 }
 
