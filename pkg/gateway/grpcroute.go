@@ -268,7 +268,7 @@ func buildGRPCRouteAction(namespace string, backendRefs []gatewayv1.GRPCBackendR
 				if firstErr == nil {
 					firstErr = &ControllerError{
 						Reason:  string(gatewayv1.RouteReasonRefNotPermitted),
-						Message: "permission error",
+						Message: fmt.Sprintf("reference to Service %s/%s not permitted by any ReferenceGrant", ns, backendRef.Name),
 					}
 				}
 				unavailableWeight += uint32(weight)
@@ -280,7 +280,7 @@ func buildGRPCRouteAction(namespace string, backendRefs []gatewayv1.GRPCBackendR
 			if firstErr == nil {
 				firstErr = &ControllerError{
 					Reason:  string(gatewayv1.RouteReasonBackendNotFound),
-					Message: "backend not found",
+					Message: fmt.Sprintf("reference to Service %s/%s not found", ns, backendRef.Name),
 				}
 			}
 			unavailableWeight += uint32(weight)
@@ -362,7 +362,7 @@ func buildGRPCRequestMirrors(
 				if firstErr == nil {
 					firstErr = &ControllerError{
 						Reason:  string(gatewayv1.RouteReasonRefNotPermitted),
-						Message: "permission error",
+						Message: fmt.Sprintf("reference to Service %s/%s not permitted by any ReferenceGrant", ns, backendRef.Name),
 					}
 				}
 				continue
@@ -372,7 +372,7 @@ func buildGRPCRequestMirrors(
 			if firstErr == nil {
 				firstErr = &ControllerError{
 					Reason:  string(gatewayv1.RouteReasonBackendNotFound),
-					Message: "backend not found",
+					Message: fmt.Sprintf("reference to Service %s/%s not found", ns, backendRef.Name),
 				}
 			}
 			continue

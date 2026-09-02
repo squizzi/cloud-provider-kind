@@ -5,6 +5,9 @@ import (
 	"sort"
 	"testing"
 
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
@@ -126,4 +129,58 @@ func sortRouteGroupKinds(kinds []gatewayv1.RouteGroupKind) {
 	sort.Slice(kinds, func(i, j int) bool {
 		return kinds[i].Kind < kinds[j].Kind
 	})
+}
+
+func TestRecordAcceptedRoute(t *testing.T) {
+	statuses := make(map[types.NamespacedName][]gatewayv1.RouteParentStatus)
+	var attached []gatewayv1.SectionName
+	parentStatuses := []gatewayv1.RouteParentStatus{{ParentRef: gatewayv1.ParentReference{Name: "gw"}}}
+	listeners := []gatewayv1.Listener{
+		{Name: "http"},
+		{Name: "http"},
+		{Name: "https"},
+	}
+
+	recordAcceptedRoute("route", "default", parentStatuses, listeners, statuses, func(name gatewayv1.SectionName) {
+		attached = append(attached, name)
+	})
+
+	key := types.NamespacedName{Name: "route", Namespace: "default"}
+	if !reflect.DeepEqual(statuses[key], parentStatuses) {
+		t.Errorf("statuses[%v] = %v, want %v", key, statuses[key], parentStatuses)
+	}
+	wantAttached := []gatewayv1.SectionName{"http", "https"}
+	if !reflect.DeepEqual(attached, wantAttached) {
+		t.Errorf("attached = %v, want %v", attached, wantAttached)
+	}
+
+	recordAcceptedRoute("empty", "default", nil, nil, statuses, func(gatewayv1.SectionName) {
+		t.Error("attach should not be called for empty statuses and listeners")
+	})
+	if _, ok := statuses[types.NamespacedName{Name: "empty", Namespace: "default"}]; ok {
+		t.Error("empty parent statuses should not be stored")
+	}
+}
+
+func TestMergeTranslatedRouteStatus(t *testing.T) {
+	key := types.NamespacedName{Name: "route", Namespace: "default"}
+	statuses := map[types.NamespacedName][]gatewayv1.RouteParentStatus{
+		key: {{
+			ParentRef: gatewayv1.ParentReference{Name: "gw"},
+			Conditions: []metav1.Condition{{
+				Type:   string(gatewayv1.RouteConditionAccepted),
+				Status: metav1.ConditionTrue,
+			}},
+		}},
+	}
+	resolved := createNotResolvedCondition(gatewayv1.RouteReasonBackendNotFound, "reference to Service default/missing not found", 1)
+	mergeTranslatedRouteStatus("route", "default", 1, statuses, nil, &resolved, nil)
+
+	got := meta.FindStatusCondition(statuses[key][0].Conditions, string(gatewayv1.RouteConditionResolvedRefs))
+	if got == nil || got.Status != metav1.ConditionFalse {
+		t.Fatalf("ResolvedRefs = %v, want False", got)
+	}
+	if got.Message != resolved.Message {
+		t.Errorf("ResolvedRefs.Message = %q, want %q", got.Message, resolved.Message)
+	}
 }

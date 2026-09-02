@@ -175,17 +175,11 @@ func parentStillHasListener(gateway *gatewayv1.Gateway, parentRef gatewayv1.Pare
 	if remainingListeners == nil {
 		return false
 	}
-	refNamespace := gateway.Namespace
-	if parentRef.Namespace != nil {
-		refNamespace = string(*parentRef.Namespace)
-	}
-	if parentRef.Name != gatewayv1.ObjectName(gateway.Name) || refNamespace != gateway.Namespace {
+	if !parentRefTargetsGateway(parentRef, gateway.Namespace, gateway) {
 		return false
 	}
 	for _, listener := range gateway.Spec.Listeners {
-		sectionNameMatches := parentRef.SectionName == nil || *parentRef.SectionName == listener.Name
-		portMatches := parentRef.Port == nil || *parentRef.Port == listener.Port
-		if !sectionNameMatches || !portMatches {
+		if !parentRefMatchesListener(parentRef, listener) {
 			continue
 		}
 		if _, ok := remainingListeners[listener.Name]; ok {

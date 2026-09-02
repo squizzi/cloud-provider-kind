@@ -46,6 +46,22 @@ func makeGRPCRuleWithBackend(svcName string) gatewayv1.GRPCRouteRule {
 	}
 }
 
+func makeGRPCRuleWithNamespacedBackend(name, namespace string) gatewayv1.GRPCRouteRule {
+	return gatewayv1.GRPCRouteRule{
+		BackendRefs: []gatewayv1.GRPCBackendRef{
+			{
+				BackendRef: gatewayv1.BackendRef{
+					BackendObjectReference: gatewayv1.BackendObjectReference{
+						Name:      gatewayv1.ObjectName(name),
+						Namespace: ptr.To(gatewayv1.Namespace(namespace)),
+						Port:      ptr.To(gatewayv1.PortNumber(80)),
+					},
+				},
+			},
+		},
+	}
+}
+
 func makeGRPCRuleWithMatch(match gatewayv1.GRPCRouteMatch) gatewayv1.GRPCRouteRule {
 	return gatewayv1.GRPCRouteRule{
 		Matches: []gatewayv1.GRPCRouteMatch{match},
@@ -74,11 +90,15 @@ func grpcHeaderModifierFilter() gatewayv1.GRPCRouteFilter {
 }
 
 func grpcRequestMirrorFilter() gatewayv1.GRPCRouteFilter {
+	return grpcRequestMirrorFilterTo("svc")
+}
+
+func grpcRequestMirrorFilterTo(name string) gatewayv1.GRPCRouteFilter {
 	return gatewayv1.GRPCRouteFilter{
 		Type: gatewayv1.GRPCRouteFilterRequestMirror,
 		RequestMirror: &gatewayv1.HTTPRequestMirrorFilter{
 			BackendRef: gatewayv1.BackendObjectReference{
-				Name: "svc",
+				Name: gatewayv1.ObjectName(name),
 				Port: ptr.To(gatewayv1.PortNumber(80)),
 			},
 		},
@@ -107,7 +127,8 @@ func grpcExtensionRefFilter() gatewayv1.GRPCRouteFilter {
 
 func TestTranslateGRPCRouteToEnvoyRoutes(t *testing.T) {
 	svc := makeService("default", "svc", 80)
-	svcLister := newMockServiceLister(svc)
+	crossSvc := makeService("other-ns", "cross-svc", 80)
+	svcLister := newMockServiceLister(svc, crossSvc)
 	noGrants := newFakeReferenceGrantLister(nil, nil)
 
 	baseRoute := &gatewayv1.GRPCRoute{
@@ -119,12 +140,13 @@ func TestTranslateGRPCRouteToEnvoyRoutes(t *testing.T) {
 	}
 
 	tests := []struct {
-		name                  string
-		rules                 []gatewayv1.GRPCRouteRule
-		wantRoutes            int
-		wantAcceptedFalse     bool
-		wantResolvedRefsFalse bool
-		wantPartiallyInvalid  bool
+		name                    string
+		rules                   []gatewayv1.GRPCRouteRule
+		wantRoutes              int
+		wantAcceptedFalse       bool
+		wantResolvedRefsFalse   bool
+		wantResolvedRefsMessage string
+		wantPartiallyInvalid    bool
 	}{
 		{
 			name: "exact method match with service and method",
@@ -181,8 +203,27 @@ func TestTranslateGRPCRouteToEnvoyRoutes(t *testing.T) {
 			rules: []gatewayv1.GRPCRouteRule{
 				makeGRPCRuleWithBackend("missing-svc"),
 			},
-			wantRoutes:            1,
-			wantResolvedRefsFalse: true,
+			wantRoutes:              1,
+			wantResolvedRefsFalse:   true,
+			wantResolvedRefsMessage: "reference to Service default/missing-svc not found",
+		},
+		{
+			name: "missing request mirror backend - ResolvedRefs=False",
+			rules: []gatewayv1.GRPCRouteRule{
+				makeGRPCRuleWithFilters(grpcRequestMirrorFilterTo("missing-mirror")),
+			},
+			wantRoutes:              1,
+			wantResolvedRefsFalse:   true,
+			wantResolvedRefsMessage: "reference to Service default/missing-mirror not found",
+		},
+		{
+			name: "cross-namespace backend without ReferenceGrant - ResolvedRefs=False",
+			rules: []gatewayv1.GRPCRouteRule{
+				makeGRPCRuleWithNamespacedBackend("cross-svc", "other-ns"),
+			},
+			wantRoutes:              1,
+			wantResolvedRefsFalse:   true,
+			wantResolvedRefsMessage: "reference to Service other-ns/cross-svc not permitted by any ReferenceGrant",
 		},
 	}
 
@@ -217,6 +258,9 @@ func TestTranslateGRPCRouteToEnvoyRoutes(t *testing.T) {
 			if tt.wantResolvedRefsFalse {
 				if resolvedRefsFailure == nil {
 					t.Fatalf("ResolvedRefs condition is nil, want ResolvedRefs=False")
+				}
+				if tt.wantResolvedRefsMessage != "" && resolvedRefsFailure.Message != tt.wantResolvedRefsMessage {
+					t.Errorf("ResolvedRefs.Message = %q, want %q", resolvedRefsFailure.Message, tt.wantResolvedRefsMessage)
 				}
 			} else if resolvedRefsFailure != nil {
 				t.Errorf("unexpected ResolvedRefs condition")
